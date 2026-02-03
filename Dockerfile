@@ -1,6 +1,5 @@
 FROM node:22-bookworm
 
-# Install Bun (required for some build scripts)
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
@@ -34,5 +33,6 @@ ENV NODE_ENV=production
 RUN chown -R node:node /app
 USER node
 
-# Default command, Render overrides this via render.yaml dockerCommand
-CMD ["node", "dist/index.js", "gateway", "--allow-unconfigured"]
+# Render injects PORT at runtime.
+# Force listen on 0.0.0.0 so Render can detect the open port.
+CMD ["sh", "-lc", "exec node dist/index.js gateway --allow-unconfigured --bind 0.0.0.0 --port \"$PORT\""]
