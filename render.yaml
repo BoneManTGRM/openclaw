@@ -4,6 +4,9 @@ services:
     runtime: docker
     plan: standard
 
+    # IMPORTANT: use the wrapper instead of inline exec
+    dockerCommand: node scripts/render-start.mjs
+
     envVars:
       - key: SETUP_PASSWORD
         sync: false
@@ -17,6 +20,7 @@ services:
       - key: OPENCLAW_WORKSPACE_DIR
         value: /data/workspace
 
+      # This is REQUIRED for the Control UI pairing
       - key: OPENCLAW_GATEWAY_TOKEN
         generateValue: true
 
