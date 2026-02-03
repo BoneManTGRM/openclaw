@@ -18,10 +18,6 @@ services:
         value: 0.0.0.0
       - key: BIND
         value: 0.0.0.0
-      - key: LISTEN_HOST
-        value: 0.0.0.0
-      - key: SERVER_HOST
-        value: 0.0.0.0
     disk:
       name: openclaw-data
       mountPath: /data
