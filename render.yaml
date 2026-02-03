@@ -4,8 +4,8 @@ services:
     runtime: docker
     plan: standard
 
-    # Let OpenClaw use Render's assigned PORT
-    dockerCommand: node dist/index.js gateway --allow-unconfigured --bind 0.0.0.0 --port $PORT
+    # Add telegram flag to enable Telegram bot
+    dockerCommand: node dist/index.js gateway --allow-unconfigured --bind 0.0.0.0 --port $PORT --telegram
 
     envVars:
       - key: SETUP_PASSWORD
@@ -24,37 +24,12 @@ services:
 
       - key: NODE_OPTIONS
         value: --max-old-space-size=1700
-
-      # Gateway URL for Telegram bot to connect
-      - key: OPENCLAW_GATEWAY_URL
-        value: https://openclaw.onrender.com
+      
+      # Explicitly enable Telegram
+      - key: ENABLE_TELEGRAM
+        value: "true"
 
     disk:
       name: openclaw-data
       mountPath: /data
       sizeGB: 2
-
-  # Telegram bot service
-  - type: worker
-    name: clawdbot-telegram
-    runtime: docker
-    plan: starter
-
-    dockerCommand: node dist/index.js telegram
-
-    envVars:
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-
-      - key: OPENCLAW_GATEWAY_URL
-        value: https://openclaw.onrender.com
-
-      # Share the same gateway token
-      - key: OPENCLAW_GATEWAY_TOKEN
-        fromService:
-          name: openclaw
-          type: web
-          envVarKey: OPENCLAW_GATEWAY_TOKEN
-
-      - key: NODE_OPTIONS
-        value: --max-old-space-size=512
