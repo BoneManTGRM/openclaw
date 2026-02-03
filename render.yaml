@@ -4,8 +4,11 @@ services:
     runtime: docker
     plan: standard
 
-    # IMPORTANT: use the wrapper instead of inline exec
-    dockerCommand: node scripts/render-start.mjs
+    # Force Render to run OpenClaw gateway (do not run render-start.mjs)
+    dockerCommand:
+      - sh
+      - -lc
+      - exec node dist/index.js gateway --allow-unconfigured --bind lan --port "${PORT:-10000}"
 
     envVars:
       - key: SETUP_PASSWORD
@@ -14,13 +17,15 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
 
+      - key: TELEGRAM_ALLOWED_CHAT_IDS
+        value: "930276646"
+
       - key: OPENCLAW_STATE_DIR
         value: /data/.openclaw
 
       - key: OPENCLAW_WORKSPACE_DIR
         value: /data/workspace
 
-      # This is REQUIRED for the Control UI pairing
       - key: OPENCLAW_GATEWAY_TOKEN
         generateValue: true
 
