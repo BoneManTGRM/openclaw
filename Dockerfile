@@ -1,5 +1,6 @@
 FROM node:22-bookworm
 
+# Install Bun (required for some build scripts)
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
@@ -23,13 +24,17 @@ COPY scripts ./scripts
 RUN pnpm install --frozen-lockfile
 
 COPY . .
+
 RUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:build
 
 ENV NODE_ENV=production
 
-RUN chown -R node:node /app
-USER node
+# Optional, helps some platforms, not required
+EXPOSE 10000
 
-CMD ["sh", "-c", "exec node dist/index.js gateway --allow-unconfigured --bind lan --port ${PORT:-10000}"]
+# IMPORTANT:
+# Do not set PORT manually in Render env vars.
+# Render injects PORT automatically at runtime.
+CMD ["sh", "-lc", "exec node dist/index.js gateway --allow-unconfigured --bind lan --port \"${PORT:-10000}\""]
