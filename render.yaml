@@ -4,12 +4,6 @@ services:
     runtime: docker
     plan: standard
 
-    # Force Render to run OpenClaw gateway (do not run render-start.mjs)
-    dockerCommand:
-      - sh
-      - -lc
-      - exec node dist/index.js gateway --allow-unconfigured --bind lan --port "${PORT:-10000}"
-
     envVars:
       - key: SETUP_PASSWORD
         sync: false
