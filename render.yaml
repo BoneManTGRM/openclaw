@@ -1,8 +1,9 @@
 services:
-  - type: worker
+  - type: web
     name: openclaw
     runtime: docker
     plan: standard
+
     envVars:
       - key: SETUP_PASSWORD
         sync: false
@@ -11,8 +12,20 @@ services:
         value: /data/.openclaw
       - key: OPENCLAW_WORKSPACE_DIR
         value: /data/workspace
+
+      # Required when binding beyond loopback
       - key: OPENCLAW_GATEWAY_TOKEN
         generateValue: true
+
+      # Fix Render port scan:
+      # Render expects your app to listen on $PORT (10000 on Render).
+      - key: OPENCLAW_GATEWAY_PORT
+        value: "10000"
+
+      # Fix loopback bind:
+      # "lan" makes it bind on 0.0.0.0 (public) instead of 127.0.0.1
+      - key: OPENCLAW_GATEWAY_BIND
+        value: "lan"
 
       - key: NODE_OPTIONS
         value: --max-old-space-size=1700
