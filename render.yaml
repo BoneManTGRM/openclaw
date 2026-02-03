@@ -5,8 +5,9 @@ services:
     plan: standard
 
     dockerCommand:
-      - node
-      - scripts/render-start.mjs
+      - sh
+      - -lc
+      - exec node dist/index.js gateway --allow-unconfigured --bind lan --port "$PORT"
 
     envVars:
       - key: SETUP_PASSWORD
