@@ -4,13 +4,16 @@ services:
     runtime: docker
     plan: standard
 
-    # Use sh -c so ${PORT} expands, then bind to 0.0.0.0 so Render can detect it
-    dockerCommand: >
-      sh -c "node dist/index.js gateway --allow-unconfigured --host 0.0.0.0 --bind 0.0.0.0 --port ${PORT} --telegram"
+    dockerCommand: "sh -lc 'node dist/index.js gateway --allow-unconfigured --bind 0.0.0.0 --port ${PORT} --telegram'"
 
     envVars:
       - key: SETUP_PASSWORD
         sync: false
+
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_CHAT_IDS
+        value: "930276646"
 
       - key: OPENCLAW_STATE_DIR
         value: /data/.openclaw
@@ -22,12 +25,6 @@ services:
 
       - key: NODE_OPTIONS
         value: --max-old-space-size=1700
-
-      # Telegram
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_ALLOWED_CHAT_IDS
-        value: "930276646"
 
     disk:
       name: openclaw-data
