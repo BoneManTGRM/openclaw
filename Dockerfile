@@ -35,14 +35,11 @@ ENV NODE_ENV=production
 RUN chown -R node:node /app
 
 # Security hardening: Run as non-root user
-# The node:22-bookworm image includes a 'node' user (uid 1000)
-# This reduces the attack surface by preventing container escape via root privileges
 USER node
 
-# Start gateway server with default config.
-# Binds to loopback (127.0.0.1) by default for security.
-#
-# For container platforms requiring external health checks:
-#   1. Set OPENCLAW_GATEWAY_TOKEN or OPENCLAW_GATEWAY_PASSWORD env var
-#   2. Override CMD: ["node","dist/index.js","gateway","--allow-unconfigured","--bind","lan"]
-CMD ["node", "dist/index.js", "gateway", "--allow-unconfigured"]
+# Render needs the service to bind to 0.0.0.0 and to the provided $PORT.
+# Use a shell entrypoint so ${PORT} expands.
+ENTRYPOINT ["sh", "-lc"]
+
+# Start gateway on Render's assigned port, publicly reachable
+CMD ["exec node dist/index.js gateway --allow-unconfigured --bind 0.0.0.0 --port ${PORT:-10000}"]
