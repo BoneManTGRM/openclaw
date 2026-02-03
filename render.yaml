@@ -4,9 +4,14 @@ services:
     runtime: docker
     plan: standard
 
+    # IMPORTANT: force OpenClaw to bind publicly so Render detects the port
+    dockerCommand: node dist/index.js gateway --allow-unconfigured --bind lan --port 10000
+
     envVars:
-      # Keep this if you want the web UI/setup protected
       - key: SETUP_PASSWORD
+        sync: false
+
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
 
       - key: OPENCLAW_STATE_DIR
@@ -14,26 +19,16 @@ services:
       - key: OPENCLAW_WORKSPACE_DIR
         value: /data/workspace
 
+      # Required when you bind beyond localhost
       - key: OPENCLAW_GATEWAY_TOKEN
         generateValue: true
 
       - key: NODE_OPTIONS
         value: --max-old-space-size=1700
 
-      # Critical fix: bind publicly so Render can detect the port
-      # "lan" binds to 0.0.0.0
-      - key: OPENCLAW_GATEWAY_BIND
-        value: lan
-      # Keep your service on Render's port
-      - key: OPENCLAW_GATEWAY_PORT
+      # Keep Render's port fixed and match the command above
+      - key: PORT
         value: "10000"
-
-      # Telegram (polling is fine on Render)
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      # Optional: only if your Openclaw build actually supports an allowlist env var
-      - key: TELEGRAM_ALLOWED_CHAT_IDS
-        value: "930276646"
 
     disk:
       name: openclaw-data
