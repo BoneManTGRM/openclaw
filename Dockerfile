@@ -26,18 +26,18 @@ RUN pnpm install --frozen-lockfile
 COPY . .
 RUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build
 
-# Force pnpm for UI build
+# Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:build
 
 ENV NODE_ENV=production
 
+# Allow non-root user to write temp files during runtime/tests.
 RUN chown -R node:node /app
+
+# Security hardening: Run as non-root user
 USER node
 
-# Run through a shell so ${PORT} expands on Render
-ENTRYPOINT ["sh", "-lc"]
-
-# Start gateway on Render's assigned port, publicly reachable
-# bind "lan" is the correct equivalent of 0.0.0.0 for OpenClaw
-CMD ["exec node dist/index.js gateway --allow-unconfigured --bind lan --port ${PORT:-10000} --telegram"]
+# Render requires listening on $PORT, and OpenClaw needs --bind lan to be reachable
+# Use a shell so $PORT expands correctly
+CMD ["/bin/sh", "-lc", "exec node dist/index.js gateway --allow-unconfigured --bind lan --port \"$PORT\""]
