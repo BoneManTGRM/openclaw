@@ -1,6 +1,5 @@
 FROM node:22-bookworm
 
-# Install Bun (required for build scripts)
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
@@ -31,9 +30,6 @@ RUN pnpm ui:build
 ENV NODE_ENV=production
 
 RUN chown -R node:node /app
-
 USER node
 
-# Render needs a public bind and a dynamic port.
-# OpenClaw bind values: loopback, lan, tailnet, auto, custom.
 CMD ["sh", "-c", "exec node dist/index.js gateway --allow-unconfigured --bind lan --port ${PORT:-10000}"]
