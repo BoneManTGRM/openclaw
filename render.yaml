@@ -4,13 +4,15 @@ services:
     runtime: docker
     plan: standard
 
+    # Use a shell so $PORT expands correctly
+    dockerCommand: /bin/sh -lc 'exec node dist/index.js gateway --allow-unconfigured --bind lan --port "$PORT"'
+
     envVars:
       - key: SETUP_PASSWORD
         sync: false
 
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-
       - key: TELEGRAM_ALLOWED_CHAT_IDS
         value: "930276646"
 
