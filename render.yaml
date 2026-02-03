@@ -25,9 +25,36 @@ services:
       - key: NODE_OPTIONS
         value: --max-old-space-size=1700
 
-      # Remove the hardcoded PORT - let Render assign it dynamically
+      # Gateway URL for Telegram bot to connect
+      - key: OPENCLAW_GATEWAY_URL
+        value: https://openclaw.onrender.com
 
     disk:
       name: openclaw-data
       mountPath: /data
       sizeGB: 2
+
+  # Telegram bot service
+  - type: worker
+    name: clawdbot-telegram
+    runtime: docker
+    plan: starter
+
+    dockerCommand: node dist/index.js telegram
+
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+
+      - key: OPENCLAW_GATEWAY_URL
+        value: https://openclaw.onrender.com
+
+      # Share the same gateway token
+      - key: OPENCLAW_GATEWAY_TOKEN
+        fromService:
+          name: openclaw
+          type: web
+          envVarKey: OPENCLAW_GATEWAY_TOKEN
+
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=512
