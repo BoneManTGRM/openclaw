@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: worker
     name: openclaw
     runtime: docker
     plan: standard
@@ -17,20 +17,11 @@ services:
       - key: NODE_OPTIONS
         value: --max-old-space-size=1700
 
-      - key: HOST
-        value: 0.0.0.0
-      - key: BIND
-        value: 0.0.0.0
-
-      # Render requires binding to $PORT
-      - key: PORT
-        value: "10000"
-
-      # Try to force Openclaw itself to bind publicly
-      - key: OPENCLAW_PORT
-        value: "10000"
-      - key: OPENCLAW_HOST
-        value: 0.0.0.0
+      # Telegram
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_CHAT_IDS
+        value: "930276646"
 
     disk:
       name: openclaw-data
