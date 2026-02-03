@@ -4,8 +4,8 @@ services:
     runtime: docker
     plan: standard
 
-    # IMPORTANT: force OpenClaw to bind publicly so Render detects the port
-    dockerCommand: node dist/index.js gateway --allow-unconfigured --bind lan --port 10000
+    # Let OpenClaw use Render's assigned PORT
+    dockerCommand: node dist/index.js gateway --allow-unconfigured --bind 0.0.0.0 --port $PORT
 
     envVars:
       - key: SETUP_PASSWORD
@@ -19,16 +19,13 @@ services:
       - key: OPENCLAW_WORKSPACE_DIR
         value: /data/workspace
 
-      # Required when you bind beyond localhost
       - key: OPENCLAW_GATEWAY_TOKEN
         generateValue: true
 
       - key: NODE_OPTIONS
         value: --max-old-space-size=1700
 
-      # Keep Render's port fixed and match the command above
-      - key: PORT
-        value: "10000"
+      # Remove the hardcoded PORT - let Render assign it dynamically
 
     disk:
       name: openclaw-data
