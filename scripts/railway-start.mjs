@@ -52,10 +52,11 @@ function canWriteDir(dir) {
   }
 }
 
-const port = String(process.env.PORT || "10000");
+const port = String(process.env.PORT || "8080");
 const token = process.env.OPENCLAW_GATEWAY_TOKEN || "";
 
-// Pick a writable state dir
+// Pick a writable state directory.
+// The key fix is we will ALSO pass this into the child env as OPENCLAW_STATE_DIR.
 const candidates = [
   process.env.OPENCLAW_STATE_DIR,
   "/data/.openclaw",
@@ -80,26 +81,25 @@ safeMkdir(stateDir);
 const configA = path.join(stateDir, "openclaw.json");
 const configB = path.join(stateDir, "config.json");
 
-// Merge existing config (prefer A, then B)
+// Merge existing config (prefer A then B)
 const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 base.gateway = base.gateway || {};
 
-// Required gateway settings for Railway
+// Ensure gateway settings
 base.gateway.port = Number(port);
 base.gateway.bind = base.gateway.bind || "lan";
 
-// Trust common proxy ranges plus Railway CGNAT range (100.64.0.0/10)
+// Trust common proxy ranges so websocket works behind Railway
 base.gateway.trustedProxies = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
   "10.0.0.0/8",
   "172.16.0.0/12",
   "192.168.0.0/16",
-  "100.64.0.0/10",
   "127.0.0.1",
   "::1",
 ]);
 
-// Enforce token auth
+// Token auth for the Control UI
 if (token) {
   base.gateway.auth = base.gateway.auth || {};
   base.gateway.auth.mode = "token";
@@ -113,7 +113,7 @@ if (!wroteA && !wroteB) {
   console.log("[railway-start] warning: could not write config files, continuing anyway");
 }
 
-// Start OpenClaw gateway
+// Start OpenClaw, forcing OPENCLAW_STATE_DIR for the running gateway process
 const args = [
   "dist/index.js",
   "gateway",
@@ -124,9 +124,15 @@ const args = [
   port,
 ];
 
-console.log("[railway-start] exec:", ["node", ...args].join(" "));
+const childEnv = {
+  ...process.env,
+  OPENCLAW_STATE_DIR: stateDir,
+};
 
-const child = spawn("node", args, { stdio: "inherit", env: process.env });
+console.log("[railway-start] exec:", ["node", ...args].join(" "));
+console.log("[railway-start] env OPENCLAW_STATE_DIR =", childEnv.OPENCLAW_STATE_DIR);
+
+const child = spawn("node", args, { stdio: "inherit", env: childEnv });
 
 child.on("exit", (code) => process.exit(code ?? 0));
 child.on("error", (err) => {
