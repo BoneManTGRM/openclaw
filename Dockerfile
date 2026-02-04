@@ -33,6 +33,4 @@ ENV NODE_ENV=production
 RUN chown -R node:node /app
 USER node
 
-# Render injects PORT at runtime.
-# Force listen on 0.0.0.0 so Render can detect the open port.
-CMD ["sh", "-lc", "exec node dist/index.js gateway --allow-unconfigured --bind 0.0.0.0 --port \"$PORT\""]
+CMD ["sh", "/app/scripts/render-start.sh"]
