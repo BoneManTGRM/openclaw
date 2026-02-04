@@ -11,6 +11,18 @@ function uniq(arr) {
   return Array.from(new Set((arr || []).filter(Boolean)));
 }
 
+function envBool(name, defaultValue = false) {
+  const v = String(process.env[name] || "").trim().toLowerCase();
+  if (!v) return defaultValue;
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function envInt(name, fallback) {
+  const raw = String(process.env[name] || "").trim();
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function readJsonIfExists(p) {
   try {
     if (!fs.existsSync(p)) return null;
@@ -54,44 +66,65 @@ function canWriteDir(dir) {
   }
 }
 
-function envBool(name, defaultValue = false) {
-  const v = String(process.env[name] || "").trim().toLowerCase();
-  if (!v) return defaultValue;
-  return v === "1" || v === "true" || v === "yes" || v === "on";
+function parseTrustedProxies() {
+  // Allow override: OPENCLAW_TRUSTED_PROXIES="a,b,c"
+  const override = String(process.env.OPENCLAW_TRUSTED_PROXIES || "").trim();
+  const base = [
+    "100.64.0.0/10",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "127.0.0.1/32",
+    "::1/128",
+  ];
+  const extra = override
+    ? override.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
+  return uniq([...base, ...extra]);
 }
 
-function pickWipStateDir() {
-  const candidates = [
-    process.env.OPENCLAW_STATE_DIR,
-    "/data/.openclaw",
-    "/home/node/.openclaw",
-    "/tmp/.openclaw",
-  ].filter(Boolean);
-
-  let chosen = candidates[0] || "/home/node/.openclaw";
-  for (const dir of candidates) {
-    if (canWriteDir(dir)) {
-      chosen = dir;
-      break;
-    }
-  }
-  return chosen;
+function tcpCheck(host, port, timeoutMs = 800) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host, port });
+    const done = (ok) => {
+      try { sock.destroy(); } catch {}
+      resolve(ok);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.on("connect", () => done(true));
+    sock.on("timeout", () => done(false));
+    sock.on("error", () => done(false));
+  });
 }
 
-// Railway external port
-const publicPort = Number(process.env.PORT || "8080");
+const externalPort = envInt("PORT", 8080);
 
-// Internal port for OpenClaw (not exposed directly)
-const internalPort = Number(process.env.OPENCLAW_INTERNAL_PORT || "3333");
+// OpenClaw will run on an internal port behind a local proxy.
+// You can override with OPENCLAW_INTERNAL_PORT if you want.
+const internalPort = envInt("OPENCLAW_INTERNAL_PORT", externalPort + 1);
 
-// Token auth for Control UI, optional
+// Token auth is optional. If you enable it, your UI/API will require the token.
 const token = String(process.env.OPENCLAW_GATEWAY_TOKEN || "").trim();
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
-const stateDir = pickWipStateDir();
+// Choose a writable state directory (and pass it to OpenClaw).
+const candidates = [
+  process.env.OPENCLAW_STATE_DIR,
+  "/data/.openclaw",
+  "/home/node/.openclaw",
+  "/tmp/.openclaw",
+].filter(Boolean);
 
-console.log("[railway-start] publicPort =", publicPort);
-console.log("[railway-start] internalPort =", internalPort);
+let stateDir = candidates[0] || "/home/node/.openclaw";
+for (const dir of candidates) {
+  if (canWriteDir(dir)) {
+    stateDir = dir;
+    break;
+  }
+}
+
+console.log("[railway-start] external PORT =", externalPort);
+console.log("[railway-start] internal OpenClaw port =", internalPort);
 console.log("[railway-start] chosen stateDir =", stateDir);
 console.log("[railway-start] token present =", token ? "yes" : "no");
 console.log("[railway-start] enforce token auth =", enforceTokenAuth ? "yes" : "no");
@@ -105,138 +138,149 @@ const configB = path.join(stateDir, "config.json");
 const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 base.gateway = base.gateway || {};
 
-// IMPORTANT: OpenClaw listens on internalPort only
-base.gateway.port = internalPort;
+// Ensure gateway settings (internal listener)
+base.gateway.port = Number(internalPort);
 
-// Bind so wrapper can reach it
-// 127.0.0.1 is fine because wrapper runs in same container
-base.gateway.bind = "127.0.0.1";
+// Bind locally so only the proxy exposes it publicly.
+// If OpenClaw expects "lan"/"local", 127.0.0.1 is still typically accepted.
+// If OpenClaw rejects it, the CLI flags below still force bind.
+base.gateway.bind = base.gateway.bind || "127.0.0.1";
 
-// Trusted proxies for Railway and common private ranges
+// Trusted proxies
 base.gateway.trustedProxies = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
-  "100.64.0.0/10",
-  "10.0.0.0/8",
-  "172.16.0.0/12",
-  "192.168.0.0/16",
-  "127.0.0.1/32",
-  "::1/128",
+  ...parseTrustedProxies(),
 ]);
 
-// Token auth optional
+// Token auth (optional)
 if (enforceTokenAuth && token) {
   base.gateway.auth = base.gateway.auth || {};
   base.gateway.auth.mode = "token";
   base.gateway.auth.token = token;
   console.log("[railway-start] gateway auth enabled (token)");
 } else {
-  if (base.gateway.auth) {
-    delete base.gateway.auth;
-    console.log("[railway-start] gateway auth disabled");
-  }
+  if (base.gateway.auth) delete base.gateway.auth;
+  console.log("[railway-start] gateway auth disabled (healthcheck friendly)");
 }
 
 const wroteA = safeWriteJson(configA, base);
 const wroteB = safeWriteJson(configB, base);
-
 if (!wroteA && !wroteB) {
   console.log("[railway-start] warning: could not write config files, continuing anyway");
 }
 
-// Spawn OpenClaw gateway
-const clawArgs = [
-  "dist/index.js",
-  "gateway",
-  "--allow-unconfigured",
-  "--bind",
-  "127.0.0.1",
-  "--port",
-  String(internalPort),
-];
+// Start OpenClaw on the internal port.
+function startOpenClaw() {
+  const childEnv = {
+    ...process.env,
+    OPENCLAW_STATE_DIR: stateDir,
+  };
 
-const childEnv = {
-  ...process.env,
-  OPENCLAW_STATE_DIR: stateDir,
-};
+  const distEntry = path.resolve("dist/index.js");
+  const useNodeDist = fs.existsSync(distEntry);
 
-console.log("[railway-start] spawning openclaw:", ["node", ...clawArgs].join(" "));
-console.log("[railway-start] env OPENCLAW_STATE_DIR =", childEnv.OPENCLAW_STATE_DIR);
+  if (useNodeDist) {
+    const args = [
+      distEntry,
+      "gateway",
+      "--allow-unconfigured",
+      "--bind",
+      "127.0.0.1",
+      "--port",
+      String(internalPort),
+    ];
+    console.log("[railway-start] exec:", ["node", ...args].join(" "));
+    const child = spawn("node", args, { stdio: "inherit", env: childEnv });
+    return child;
+  }
 
-const claw = spawn("node", clawArgs, { stdio: "inherit", env: childEnv });
+  // Fallback if dist is not present but openclaw binary is.
+  const args = [
+    "gateway",
+    "--allow-unconfigured",
+    "--bind",
+    "127.0.0.1",
+    "--port",
+    String(internalPort),
+  ];
+  console.log("[railway-start] exec:", ["openclaw", ...args].join(" "));
+  const child = spawn("openclaw", args, { stdio: "inherit", env: childEnv });
+  return child;
+}
+
+const claw = startOpenClaw();
 
 claw.on("exit", (code) => {
-  console.log("[railway-start] openclaw exited with", code);
+  console.error("[railway-start] OpenClaw exited with code", code);
   process.exit(code ?? 0);
 });
 claw.on("error", (err) => {
-  console.error("[railway-start] openclaw spawn error:", err);
+  console.error("[railway-start] OpenClaw spawn error:", err);
   process.exit(1);
 });
 
-// Simple reverse proxy that also supports websocket upgrades
-function proxyHttp(req, res) {
-  const options = {
-    host: "127.0.0.1",
-    port: internalPort,
-    method: req.method,
-    path: req.url,
-    headers: { ...req.headers },
-  };
+// Public server on Railway PORT that provides /health and proxies everything else.
+const server = http.createServer(async (req, res) => {
+  const url = req.url || "/";
 
-  const upstream = http.request(options, (upRes) => {
-    res.writeHead(upRes.statusCode || 502, upRes.headers);
-    upRes.pipe(res);
-  });
+  if (url === "/health") {
+    const ok = await tcpCheck("127.0.0.1", internalPort, 800);
+    res.statusCode = ok ? 200 : 503;
+    res.setHeader("content-type", "text/plain");
+    res.end(ok ? "ok" : "unavailable");
+    return;
+  }
 
-  upstream.on("error", (e) => {
+  // Proxy HTTP to OpenClaw
+  const proxyReq = http.request(
+    {
+      hostname: "127.0.0.1",
+      port: internalPort,
+      method: req.method,
+      path: url,
+      headers: {
+        ...req.headers,
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": req.headers.host || "",
+        "x-forwarded-for": req.socket.remoteAddress || "",
+      },
+    },
+    (proxyRes) => {
+      res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+      proxyRes.pipe(res);
+    }
+  );
+
+  proxyReq.on("error", (err) => {
     res.statusCode = 502;
     res.setHeader("content-type", "text/plain");
-    res.end("Bad gateway: " + (e?.message || String(e)));
+    res.end(`bad gateway: ${err?.message || err}`);
   });
 
-  req.pipe(upstream);
-}
+  req.pipe(proxyReq);
+});
 
-function proxyWebSocket(req, socket, head) {
+// Proxy WebSocket upgrades
+server.on("upgrade", (req, socket, head) => {
   const upstream = net.connect(internalPort, "127.0.0.1", () => {
     upstream.write(
-      `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n` +
-        Object.entries(req.headers)
-          .map(([k, v]) => `${k}: ${v}`)
-          .join("\r\n") +
-        "\r\n\r\n"
+      [
+        `${req.method} ${req.url} HTTP/${req.httpVersion}`,
+        ...Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`),
+        "",
+        "",
+      ].join("\r\n")
     );
-
     if (head && head.length) upstream.write(head);
-
-    socket.pipe(upstream);
-    upstream.pipe(socket);
+    socket.pipe(upstream).pipe(socket);
   });
 
   upstream.on("error", () => {
-    try {
-      socket.destroy();
-    } catch {}
+    try { socket.destroy(); } catch {}
   });
-}
-
-// Public server on Railway PORT
-const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
-    res.statusCode = 200;
-    res.setHeader("content-type", "text/plain");
-    res.end("ok");
-    return;
-  }
-  proxyHttp(req, res);
 });
 
-server.on("upgrade", (req, socket, head) => {
-  proxyWebSocket(req, socket, head);
-});
-
-server.listen(publicPort, "0.0.0.0", () => {
-  console.log("[railway-start] public server listening on", publicPort);
-  console.log("[railway-start] health endpoint is /health");
-  console.log("[railway-start] proxying to openclaw on", internalPort);
+server.listen(externalPort, "0.0.0.0", () => {
+  console.log("[railway-start] public server listening on", externalPort);
+  console.log("[railway-start] proxying to 127.0.0.1:", internalPort);
 });
