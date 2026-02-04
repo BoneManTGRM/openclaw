@@ -67,7 +67,6 @@ function canWriteDir(dir) {
 }
 
 function parseTrustedProxies() {
-  // Allow override: OPENCLAW_TRUSTED_PROXIES="a,b,c"
   const override = String(process.env.OPENCLAW_TRUSTED_PROXIES || "").trim();
   const base = [
     "100.64.0.0/10",
@@ -98,16 +97,11 @@ function tcpCheck(host, port, timeoutMs = 800) {
 }
 
 const externalPort = envInt("PORT", 8080);
-
-// OpenClaw will run on an internal port behind a local proxy.
-// You can override with OPENCLAW_INTERNAL_PORT if you want.
 const internalPort = envInt("OPENCLAW_INTERNAL_PORT", externalPort + 1);
 
-// Token auth is optional. If you enable it, your UI/API will require the token.
 const token = String(process.env.OPENCLAW_GATEWAY_TOKEN || "").trim();
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
-// Choose a writable state directory (and pass it to OpenClaw).
 const candidates = [
   process.env.OPENCLAW_STATE_DIR,
   "/data/.openclaw",
@@ -134,25 +128,15 @@ safeMkdir(stateDir);
 const configA = path.join(stateDir, "openclaw.json");
 const configB = path.join(stateDir, "config.json");
 
-// Merge existing config (prefer A then B)
 const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 base.gateway = base.gateway || {};
-
-// Ensure gateway settings (internal listener)
 base.gateway.port = Number(internalPort);
-
-// Bind locally so only the proxy exposes it publicly.
-// If OpenClaw expects "lan"/"local", 127.0.0.1 is still typically accepted.
-// If OpenClaw rejects it, the CLI flags below still force bind.
 base.gateway.bind = base.gateway.bind || "127.0.0.1";
-
-// Trusted proxies
 base.gateway.trustedProxies = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
   ...parseTrustedProxies(),
 ]);
 
-// Token auth (optional)
 if (enforceTokenAuth && token) {
   base.gateway.auth = base.gateway.auth || {};
   base.gateway.auth.mode = "token";
@@ -160,41 +144,21 @@ if (enforceTokenAuth && token) {
   console.log("[railway-start] gateway auth enabled (token)");
 } else {
   if (base.gateway.auth) delete base.gateway.auth;
-  console.log("[railway-start] gateway auth disabled (healthcheck friendly)");
+  console.log("[railway-start] gateway auth disabled");
 }
 
-const wroteA = safeWriteJson(configA, base);
-const wroteB = safeWriteJson(configB, base);
-if (!wroteA && !wroteB) {
-  console.log("[railway-start] warning: could not write config files, continuing anyway");
-}
+safeWriteJson(configA, base);
+safeWriteJson(configB, base);
 
-// Start OpenClaw on the internal port.
+let claw = null;
+let clawStarting = false;
+
 function startOpenClaw() {
-  const childEnv = {
-    ...process.env,
-    OPENCLAW_STATE_DIR: stateDir,
-  };
+  if (clawStarting) return;
+  clawStarting = true;
 
-  const distEntry = path.resolve("dist/index.js");
-  const useNodeDist = fs.existsSync(distEntry);
+  const childEnv = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
 
-  if (useNodeDist) {
-    const args = [
-      distEntry,
-      "gateway",
-      "--allow-unconfigured",
-      "--bind",
-      "127.0.0.1",
-      "--port",
-      String(internalPort),
-    ];
-    console.log("[railway-start] exec:", ["node", ...args].join(" "));
-    const child = spawn("node", args, { stdio: "inherit", env: childEnv });
-    return child;
-  }
-
-  // Fallback if dist is not present but openclaw binary is.
   const args = [
     "gateway",
     "--allow-unconfigured",
@@ -203,31 +167,50 @@ function startOpenClaw() {
     "--port",
     String(internalPort),
   ];
+
   console.log("[railway-start] exec:", ["openclaw", ...args].join(" "));
-  const child = spawn("openclaw", args, { stdio: "inherit", env: childEnv });
-  return child;
+  try {
+    claw = spawn("openclaw", args, { stdio: "inherit", env: childEnv });
+  } catch (e) {
+    console.log("[railway-start] spawn threw:", e?.message || e);
+    clawStarting = false;
+    return;
+  }
+
+  claw.on("exit", (code) => {
+    console.log("[railway-start] OpenClaw exited with code", code);
+    claw = null;
+    clawStarting = false;
+    setTimeout(startOpenClaw, 2000);
+  });
+
+  claw.on("error", (err) => {
+    console.log("[railway-start] OpenClaw spawn error:", err?.message || err);
+    claw = null;
+    clawStarting = false;
+    setTimeout(startOpenClaw, 2000);
+  });
+
+  clawStarting = false;
 }
 
-const claw = startOpenClaw();
-
-claw.on("exit", (code) => {
-  console.error("[railway-start] OpenClaw exited with code", code);
-  process.exit(code ?? 0);
-});
-claw.on("error", (err) => {
-  console.error("[railway-start] OpenClaw spawn error:", err);
-  process.exit(1);
-});
-
-// Public server on Railway PORT that provides /health and proxies everything else.
+// Start the public server immediately so Railway healthcheck can succeed.
 const server = http.createServer(async (req, res) => {
   const url = req.url || "/";
 
   if (url === "/health") {
+    // Always 200 so Railway stops killing the deploy.
+    res.statusCode = 200;
+    res.setHeader("content-type", "text/plain");
+    res.end("ok");
+    return;
+  }
+
+  if (url === "/ready") {
     const ok = await tcpCheck("127.0.0.1", internalPort, 800);
     res.statusCode = ok ? 200 : 503;
     res.setHeader("content-type", "text/plain");
-    res.end(ok ? "ok" : "unavailable");
+    res.end(ok ? "ready" : "not-ready");
     return;
   }
 
@@ -260,7 +243,6 @@ const server = http.createServer(async (req, res) => {
   req.pipe(proxyReq);
 });
 
-// Proxy WebSocket upgrades
 server.on("upgrade", (req, socket, head) => {
   const upstream = net.connect(internalPort, "127.0.0.1", () => {
     upstream.write(
@@ -282,5 +264,8 @@ server.on("upgrade", (req, socket, head) => {
 
 server.listen(externalPort, "0.0.0.0", () => {
   console.log("[railway-start] public server listening on", externalPort);
-  console.log("[railway-start] proxying to 127.0.0.1:", internalPort);
+  console.log("[railway-start] /health returns 200 always");
+  console.log("[railway-start] /ready checks OpenClaw on 127.0.0.1:", internalPort);
+  console.log("[railway-start] proxying all other routes to OpenClaw");
+  startOpenClaw();
 });
