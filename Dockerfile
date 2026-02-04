@@ -33,4 +33,4 @@ ENV NODE_ENV=production
 RUN chown -R node:node /app
 USER node
 
-CMD ["sh", "/app/scripts/render-start.sh"]
+CMD ["node", "scripts/render-start.mjs"]
