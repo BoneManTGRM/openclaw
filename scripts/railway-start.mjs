@@ -52,11 +52,20 @@ function canWriteDir(dir) {
   }
 }
 
-const port = String(process.env.PORT || "8080");
-const token = process.env.OPENCLAW_GATEWAY_TOKEN || "";
+function envBool(name, defaultValue = false) {
+  const v = String(process.env[name] || "").trim().toLowerCase();
+  if (!v) return defaultValue;
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
 
-// Pick a writable state directory.
-// The key fix is we will ALSO pass this into the child env as OPENCLAW_STATE_DIR.
+const port = String(process.env.PORT || "8080");
+
+// IMPORTANT:
+// If you set OPENCLAW_GATEWAY_TOKEN but do not set OPENCLAW_ENFORCE_TOKEN_AUTH=true,
+// we will NOT enable auth in config, so Railway healthchecks keep working.
+const token = String(process.env.OPENCLAW_GATEWAY_TOKEN || "").trim();
+const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
+
 const candidates = [
   process.env.OPENCLAW_STATE_DIR,
   "/data/.openclaw",
@@ -64,7 +73,7 @@ const candidates = [
   "/tmp/.openclaw",
 ].filter(Boolean);
 
-let stateDir = candidates[0];
+let stateDir = candidates[0] || "/home/node/.openclaw";
 for (const dir of candidates) {
   if (canWriteDir(dir)) {
     stateDir = dir;
@@ -75,6 +84,7 @@ for (const dir of candidates) {
 console.log("[railway-start] PORT =", port);
 console.log("[railway-start] chosen stateDir =", stateDir);
 console.log("[railway-start] token present =", token ? "yes" : "no");
+console.log("[railway-start] enforce token auth =", enforceTokenAuth ? "yes" : "no");
 
 safeMkdir(stateDir);
 
@@ -89,8 +99,7 @@ base.gateway = base.gateway || {};
 base.gateway.port = Number(port);
 base.gateway.bind = base.gateway.bind || "lan";
 
-// Trust common proxy ranges so websocket works behind Railway
-// Includes Railway private ranges (100.64.0.0/10) plus common RFC1918 ranges.
+// Trusted proxies for Railway and common private ranges
 base.gateway.trustedProxies = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
   "100.64.0.0/10",
@@ -101,11 +110,19 @@ base.gateway.trustedProxies = uniq([
   "::1/128",
 ]);
 
-// Token auth for the Control UI
-if (token) {
+// Token auth (OPTIONAL)
+// Only enable if OPENCLAW_ENFORCE_TOKEN_AUTH=true
+if (enforceTokenAuth && token) {
   base.gateway.auth = base.gateway.auth || {};
   base.gateway.auth.mode = "token";
   base.gateway.auth.token = token;
+  console.log("[railway-start] gateway auth enabled (token)");
+} else {
+  // Make sure we do not accidentally leave auth enabled from a previous run
+  if (base.gateway.auth) {
+    delete base.gateway.auth;
+    console.log("[railway-start] gateway auth disabled (for healthcheck compatibility)");
+  }
 }
 
 const wroteA = safeWriteJson(configA, base);
