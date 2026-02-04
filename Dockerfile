@@ -1,11 +1,9 @@
 FROM node:22-bookworm
 
-# Install Bun (required for some build scripts)
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
 RUN corepack enable
-
 WORKDIR /app
 
 ARG OPENCLAW_DOCKER_APT_PACKAGES=""
@@ -34,5 +32,4 @@ ENV NODE_ENV=production
 RUN chown -R node:node /app
 USER node
 
-# Railway: start directly with Node (no start.sh needed)
 CMD ["node", "scripts/railway-start.mjs"]
