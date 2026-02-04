@@ -52,9 +52,10 @@ function canWriteDir(dir) {
   }
 }
 
-const port = String(process.env.PORT || "8080");
+const port = String(process.env.PORT || "10000");
 const token = process.env.OPENCLAW_GATEWAY_TOKEN || "";
 
+// Pick a writable state dir
 const candidates = [
   process.env.OPENCLAW_STATE_DIR,
   "/data/.openclaw",
@@ -62,7 +63,7 @@ const candidates = [
   "/tmp/.openclaw",
 ].filter(Boolean);
 
-let stateDir = null;
+let stateDir = candidates[0];
 for (const dir of candidates) {
   if (canWriteDir(dir)) {
     stateDir = dir;
@@ -70,39 +71,40 @@ for (const dir of candidates) {
   }
 }
 
-if (!stateDir) {
-  stateDir = "/tmp/.openclaw";
-  console.log("[railway-start] no writable dir found in candidates, using", stateDir);
-  safeMkdir(stateDir);
-}
-
 console.log("[railway-start] PORT =", port);
 console.log("[railway-start] chosen stateDir =", stateDir);
 console.log("[railway-start] token present =", token ? "yes" : "no");
 
+safeMkdir(stateDir);
+
 const configA = path.join(stateDir, "openclaw.json");
 const configB = path.join(stateDir, "config.json");
 
+// Merge existing config (prefer A, then B)
 const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 base.gateway = base.gateway || {};
 
+// Required gateway settings for Railway
 base.gateway.port = Number(port);
 base.gateway.bind = base.gateway.bind || "lan";
 
-// Proxy trust for Railway style setups
+// Trust common proxy ranges plus Railway CGNAT range (100.64.0.0/10)
 base.gateway.trustedProxies = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
   "10.0.0.0/8",
   "172.16.0.0/12",
   "192.168.0.0/16",
+  "100.64.0.0/10",
   "127.0.0.1",
   "::1",
 ]);
 
-// Require token auth
-base.gateway.auth = base.gateway.auth || {};
-base.gateway.auth.mode = "token";
-base.gateway.auth.token = token;
+// Enforce token auth
+if (token) {
+  base.gateway.auth = base.gateway.auth || {};
+  base.gateway.auth.mode = "token";
+  base.gateway.auth.token = token;
+}
 
 const wroteA = safeWriteJson(configA, base);
 const wroteB = safeWriteJson(configB, base);
@@ -111,6 +113,7 @@ if (!wroteA && !wroteB) {
   console.log("[railway-start] warning: could not write config files, continuing anyway");
 }
 
+// Start OpenClaw gateway
 const args = [
   "dist/index.js",
   "gateway",
@@ -121,15 +124,9 @@ const args = [
   port,
 ];
 
-const childEnv = {
-  ...process.env,
-  OPENCLAW_STATE_DIR: stateDir,
-};
-
 console.log("[railway-start] exec:", ["node", ...args].join(" "));
-console.log("[railway-start] OPENCLAW_STATE_DIR for child =", childEnv.OPENCLAW_STATE_DIR);
 
-const child = spawn("node", args, { stdio: "inherit", env: childEnv });
+const child = spawn("node", args, { stdio: "inherit", env: process.env });
 
 child.on("exit", (code) => process.exit(code ?? 0));
 child.on("error", (err) => {
