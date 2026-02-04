@@ -20,7 +20,6 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY ui/package.json ./ui/package.json
 COPY patches ./patches
 COPY scripts ./scripts
-COPY start.sh ./start.sh
 
 RUN pnpm install --frozen-lockfile
 
@@ -35,4 +34,5 @@ ENV NODE_ENV=production
 RUN chown -R node:node /app
 USER node
 
-CMD ["sh", "./start.sh"]
+# Railway: start directly with Node (no start.sh needed)
+CMD ["node", "scripts/railway-start.mjs"]
