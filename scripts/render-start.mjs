@@ -6,24 +6,27 @@ import { spawn } from "node:child_process";
 console.log("[render-start] starting");
 
 const port = String(process.env.PORT || "10000");
-
-// Use whatever you already set in Render.
-// In your render.yaml you set OPENCLAW_STATE_DIR to /data/.openclaw
 const stateDir = process.env.OPENCLAW_STATE_DIR || "/data/.openclaw";
 
-// OpenClaw stores config in the state dir.
-// Different builds sometimes look for different filenames, so we write both.
+console.log("[render-start] PORT =", port);
+console.log("[render-start] OPENCLAW_STATE_DIR =", stateDir);
+
+// Write config into BOTH common filenames to maximize compatibility.
 const configPathA = path.join(stateDir, "openclaw.json");
 const configPathB = path.join(stateDir, "config.json");
 
 function readJsonIfExists(p) {
   try {
     if (!fs.existsSync(p)) return null;
-    const raw = fs.readFileSync(p, "utf8");
-    return JSON.parse(raw);
-  } catch {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch (e) {
+    console.log(`[render-start] could not read ${p}: ${e?.message || e}`);
     return null;
   }
+}
+
+function uniq(arr) {
+  return Array.from(new Set((arr || []).filter(Boolean)));
 }
 
 function writeJson(p, obj) {
@@ -31,43 +34,44 @@ function writeJson(p, obj) {
   console.log(`[render-start] wrote ${p}`);
 }
 
-function uniq(arr) {
-  return Array.from(new Set(arr.filter(Boolean)));
+try {
+  fs.mkdirSync(stateDir, { recursive: true });
+  console.log("[render-start] ensured state dir exists");
+} catch (e) {
+  console.log(`[render-start] failed to create state dir: ${e?.message || e}`);
 }
 
-fs.mkdirSync(stateDir, { recursive: true });
-
-// Merge into any existing config instead of nuking it.
 const base = readJsonIfExists(configPathA) || readJsonIfExists(configPathB) || {};
 base.gateway = base.gateway || {};
 
-// This is the key that fixes the 1008 behind Render proxy.
-// Trust Render internal 10.x addresses plus localhost.
-const desiredTrustedProxies = ["10.0.0.0/8", "127.0.0.1", "::1"];
+// Trust Render internal proxy ranges plus localhost.
+const desiredTrustedProxies = [
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "127.0.0.1",
+  "::1",
+];
+
 base.gateway.trustedProxies = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
   ...desiredTrustedProxies,
 ]);
 
-// Keep auth simple.
-// If you have OPENCLAW_GATEWAY_TOKEN, the UI should use it.
-// If it is missing, OpenClaw may require pairing.
+// Keep your existing token based auth if present.
 if (process.env.OPENCLAW_GATEWAY_TOKEN) {
-  base.gateway.auth = base.gateway.auth || {};
-  base.gateway.auth.mode = "token";
-  base.gateway.auth.token = process.env.OPENCLAW_GATEWAY_TOKEN;
+  base.gateway.auth = { mode: "token", token: process.env.OPENCLAW_GATEWAY_TOKEN };
 }
 
-// Keep port in sync, but do not force any host or 0.0.0.0 flags here.
 base.gateway.port = Number(port);
 
-// Write both names to maximize compatibility.
-writeJson(configPathA, base);
-writeJson(configPathB, base);
+try {
+  writeJson(configPathA, base);
+  writeJson(configPathB, base);
+} catch (e) {
+  console.log(`[render-start] failed writing config: ${e?.message || e}`);
+}
 
-// Start OpenClaw.
-// Do not pass 0.0.0.0 anywhere.
-// Only use bind mode + port.
 const args = [
   "dist/index.js",
   "gateway",
@@ -79,7 +83,6 @@ const args = [
 ];
 
 console.log("[render-start] exec:", ["node", ...args].join(" "));
-
 const child = spawn("node", args, { stdio: "inherit" });
 
 child.on("exit", (code) => process.exit(code ?? 0));
