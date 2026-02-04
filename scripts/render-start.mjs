@@ -1,10 +1,21 @@
-#!/usr/bin/env sh
-set -e
+import { spawn } from "node:child_process";
 
-# Render sets PORT automatically. Fallback only for local runs.
-: "${PORT:=10000}"
+const port = process.env.PORT || "10000";
 
-exec node dist/index.js gateway \
-  --allow-unconfigured \
-  --bind lan \
-  --port "$PORT"
+const args = [
+  "dist/index.js",
+  "gateway",
+  "--allow-unconfigured",
+  "--bind",
+  "lan",
+  "--port",
+  port,
+];
+
+const child = spawn("node", args, { stdio: "inherit" });
+
+child.on("exit", (code) => process.exit(code ?? 0));
+child.on("error", (err) => {
+  console.error("[render-start] failed to start:", err);
+  process.exit(1);
+});
