@@ -11,9 +11,11 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
 
+      # TEMP: use a fresh state dir so old config on disk cannot force loopback
       - key: OPENCLAW_STATE_DIR
-        value: /data/.openclaw
+        value: /tmp/.openclaw
 
+      # Keep workspace persistent
       - key: OPENCLAW_WORKSPACE_DIR
         value: /data/workspace
 
