@@ -20,6 +20,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY ui/package.json ./ui/package.json
 COPY patches ./patches
 COPY scripts ./scripts
+COPY start.sh ./start.sh
 
 RUN pnpm install --frozen-lockfile
 
@@ -34,5 +35,4 @@ ENV NODE_ENV=production
 RUN chown -R node:node /app
 USER node
 
-# Start via Node script to avoid sh quoting issues on Render
-CMD ["node", "scripts/render-start.mjs"]
+CMD ["sh", "./start.sh"]
