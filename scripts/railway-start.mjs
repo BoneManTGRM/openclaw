@@ -90,13 +90,15 @@ base.gateway.port = Number(port);
 base.gateway.bind = base.gateway.bind || "lan";
 
 // Trust common proxy ranges so websocket works behind Railway
+// Includes Railway private ranges (100.64.0.0/10) plus common RFC1918 ranges.
 base.gateway.trustedProxies = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
+  "100.64.0.0/10",
   "10.0.0.0/8",
   "172.16.0.0/12",
   "192.168.0.0/16",
-  "127.0.0.1",
-  "::1",
+  "127.0.0.1/32",
+  "::1/128",
 ]);
 
 // Token auth for the Control UI
