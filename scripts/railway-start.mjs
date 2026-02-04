@@ -5,44 +5,89 @@ import { spawn } from "node:child_process";
 
 console.log("[railway-start] starting");
 
-const port = String(process.env.PORT || "10000");
-const stateDir = process.env.OPENCLAW_STATE_DIR || "/data/.openclaw";
-const token = process.env.OPENCLAW_GATEWAY_TOKEN || "";
-
-const configA = path.join(stateDir, "openclaw.json");
-const configB = path.join(stateDir, "config.json");
-
-function readJsonIfExists(p) {
-  try {
-    if (!fs.existsSync(p)) return {};
-    return JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch (e) {
-    console.log(`[railway-start] could not read ${p}: ${e?.message || e}`);
-    return {};
-  }
-}
-
-function writeJson(p, obj) {
-  fs.writeFileSync(p, JSON.stringify(obj, null, 2), "utf8");
-  console.log(`[railway-start] wrote ${p}`);
-}
-
 function uniq(arr) {
   return Array.from(new Set((arr || []).filter(Boolean)));
 }
 
-fs.mkdirSync(stateDir, { recursive: true });
+function readJsonIfExists(p) {
+  try {
+    if (!fs.existsSync(p)) return null;
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch (e) {
+    console.log(`[railway-start] could not read ${p}: ${e?.message || e}`);
+    return null;
+  }
+}
 
-// Merge with any existing config so we do not wipe other settings
-const base = {
-  ...readJsonIfExists(configA),
-  ...readJsonIfExists(configB),
-};
+function safeMkdir(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    return true;
+  } catch (e) {
+    console.log(`[railway-start] mkdir failed ${dir}: ${e?.message || e}`);
+    return false;
+  }
+}
 
+function safeWriteJson(p, obj) {
+  try {
+    fs.writeFileSync(p, JSON.stringify(obj, null, 2), "utf8");
+    console.log(`[railway-start] wrote ${p}`);
+    return true;
+  } catch (e) {
+    console.log(`[railway-start] write failed ${p}: ${e?.message || e}`);
+    return false;
+  }
+}
+
+function canWriteDir(dir) {
+  try {
+    safeMkdir(dir);
+    const test = path.join(dir, `.write-test-${Date.now()}.tmp`);
+    fs.writeFileSync(test, "ok", "utf8");
+    fs.unlinkSync(test);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const port = String(process.env.PORT || "10000");
+const token = process.env.OPENCLAW_GATEWAY_TOKEN || "";
+
+// Choose a state dir that is actually writable.
+// Railway may or may not have a /data volume mounted.
+const candidates = [
+  process.env.OPENCLAW_STATE_DIR,
+  "/data/.openclaw",
+  "/home/node/.openclaw",
+  "/tmp/.openclaw",
+].filter(Boolean);
+
+let stateDir = candidates[0];
+for (const dir of candidates) {
+  if (canWriteDir(dir)) {
+    stateDir = dir;
+    break;
+  }
+}
+
+console.log("[railway-start] PORT =", port);
+console.log("[railway-start] chosen stateDir =", stateDir);
+console.log("[railway-start] token present =", token ? "yes" : "no");
+
+safeMkdir(stateDir);
+
+const configA = path.join(stateDir, "openclaw.json");
+const configB = path.join(stateDir, "config.json");
+
+// Merge existing config (prefer A, then B)
+const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 base.gateway = base.gateway || {};
 
-// Port must match Railway PORT
+// Ensure gateway settings
 base.gateway.port = Number(port);
+base.gateway.bind = base.gateway.bind || "lan";
 
 // Trust common proxy ranges so websocket is treated correctly behind Railway
 base.gateway.trustedProxies = uniq([
@@ -61,8 +106,12 @@ if (token) {
   base.gateway.auth.token = token;
 }
 
-writeJson(configA, base);
-writeJson(configB, base);
+const wroteA = safeWriteJson(configA, base);
+const wroteB = safeWriteJson(configB, base);
+
+if (!wroteA && !wroteB) {
+  console.log("[railway-start] warning: could not write config files, continuing anyway");
+}
 
 // Start OpenClaw
 const args = [
@@ -76,7 +125,8 @@ const args = [
 ];
 
 console.log("[railway-start] exec:", ["node", ...args].join(" "));
-const child = spawn("node", args, { stdio: "inherit" });
+
+const child = spawn("node", args, { stdio: "inherit", env: process.env });
 
 child.on("exit", (code) => process.exit(code ?? 0));
 child.on("error", (err) => {
