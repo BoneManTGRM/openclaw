@@ -128,7 +128,6 @@ const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
  * IMPORTANT:
  * OpenClaw `gateway --bind` expects a MODE, not an IP.
  * Valid modes include: loopback, tailnet, lan, auto, custom
- * (See OpenClaw docs for the full list and meaning)
  */
 const bindPrimary = envStr("OPENCLAW_BIND", "loopback");
 const bindFallback = envStr("OPENCLAW_BIND_FALLBACK", "lan");
@@ -323,7 +322,6 @@ function spawnOpenClawProcess(bindMode) {
 }
 
 async function isPortReadyAnyHost() {
-  // Note: do not include 0.0.0.0 here. It is a bind address, not a connect target.
   const hosts = ["127.0.0.1", "localhost", "::1"];
   for (const h of hosts) {
     // eslint-disable-next-line no-await-in-loop
@@ -545,6 +543,22 @@ function checkProxyToken(req) {
   return { ok: true, reason: "ok" };
 }
 
+/**
+ * Allow the browser UI to load even if proxy token enforcement is enabled.
+ * This only skips the token check for UI and static asset routes.
+ * If you want everything locked down, set OPENCLAW_PROXY_ENFORCE_TOKEN=0 until you finish pairing.
+ */
+function isPublicUiPath(url) {
+  const u = String(url || "/");
+  if (u === "/") return true;
+  if (u === "/favicon.ico") return true;
+  if (u === "/robots.txt") return true;
+  if (u.startsWith("/assets/")) return true;
+  if (u.startsWith("/static/")) return true;
+  if (u.startsWith("/_next/")) return true;
+  return false;
+}
+
 function buildForwardedHeaders(req) {
   const remoteAddr = req.socket?.remoteAddress || "";
   const priorXff = req.headers["x-forwarded-for"];
@@ -553,7 +567,6 @@ function buildForwardedHeaders(req) {
   const xfProto = req.headers["x-forwarded-proto"] || "https";
   const xfHost = req.headers["x-forwarded-host"] || req.headers.host || "";
 
-  // Remove hop-by-hop headers that should not be forwarded.
   const hopByHop = new Set([
     "connection",
     "keep-alive",
@@ -594,7 +607,14 @@ const server = http.createServer(async (req, res) => {
   const url = req.url || "/";
 
   // Optional: enforce a token at the proxy edge too (useful if OpenClaw gateway auth is off)
-  if (enforceProxyToken && url !== "/health" && url !== "/ready") {
+  // Keep health and readiness open. Keep debug open. Let UI paths open so the browser can load the UI.
+  if (
+    enforceProxyToken &&
+    url !== "/health" &&
+    url !== "/ready" &&
+    url !== "/debug" &&
+    !isPublicUiPath(url)
+  ) {
     const check = checkProxyToken(req);
     if (!check.ok) {
       res.statusCode = 401;
@@ -602,14 +622,6 @@ const server = http.createServer(async (req, res) => {
       res.end("unauthorized");
       return;
     }
-  }
-
-  // Friendly root so Railway "open app" does not look broken
-  if (url === "/") {
-    res.statusCode = 200;
-    res.setHeader("content-type", "text/plain");
-    res.end("ok\n/health\n/ready\n/debug\n");
-    return;
   }
 
   if (url === "/health") {
@@ -703,7 +715,9 @@ const server = http.createServer(async (req, res) => {
 
 server.on("upgrade", async (req, socket, head) => {
   try {
-    if (enforceProxyToken) {
+    const url = req.url || "/";
+
+    if (enforceProxyToken && url !== "/debug" && !isPublicUiPath(url)) {
       const check = checkProxyToken(req);
       if (!check.ok) {
         try {
