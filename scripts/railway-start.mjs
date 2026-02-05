@@ -17,7 +17,6 @@ function envBool(name, defaultValue = false) {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
-// FIX: empty string should not become 0
 function envInt(name, fallback) {
   const raw = String(process.env[name] ?? "").trim();
   if (raw.length === 0) return fallback;
@@ -119,21 +118,21 @@ const internalPort = envInt("OPENCLAW_INTERNAL_PORT", 8081);
 const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
-// Railway cold starts can be slow
 let startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 120000);
-// prevent 0ms (or tiny values) from instantly killing the child
 startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
 
 const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
 const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
 
-// Bind behavior:
-// Some builds only reliably listen when bind is 0.0.0.0.
-// We try 127.0.0.1 first, then auto flip after a failed attempt.
 const bindPrimary = envStr("OPENCLAW_BIND", "127.0.0.1");
 const bindFallback = envStr("OPENCLAW_BIND_FALLBACK", "0.0.0.0");
 
-// Prefer /tmp on Railway unless user explicitly sets OPENCLAW_STATE_DIR
+const useShellForLocalBin = envBool("OPENCLAW_SHELL_LOCAL_BIN", true);
+
+// Optional: if you want this wrapper to enforce a token on inbound requests,
+// set OPENCLAW_PROXY_ENFORCE_TOKEN=1 and OPENCLAW_GATEWAY_TOKEN=...
+const enforceProxyToken = envBool("OPENCLAW_PROXY_ENFORCE_TOKEN", false);
+
 const candidates = [
   process.env.OPENCLAW_STATE_DIR,
   "/data/.openclaw",
@@ -158,9 +157,11 @@ console.log("[railway-start] external PORT =", externalPort);
 console.log("[railway-start] internal OpenClaw port =", internalPort);
 console.log("[railway-start] chosen stateDir =", stateDir);
 console.log("[railway-start] token present =", token ? "yes" : "no");
-console.log("[railway-start] enforce token auth =", enforceTokenAuth ? "yes" : "no");
+console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
+console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" : "no");
 console.log("[railway-start] startupTimeoutMs =", startupTimeoutMs);
 console.log("[railway-start] bindPrimary =", bindPrimary, "bindFallback =", bindFallback);
+console.log("[railway-start] OPENCLAW_SHELL_LOCAL_BIN =", useShellForLocalBin ? "yes" : "no");
 
 safeMkdir(stateDir);
 
@@ -170,7 +171,6 @@ const configB = path.join(stateDir, "config.json");
 const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 base.gateway = base.gateway || {};
 
-// Do not write "bind" into config. Use CLI args for bind.
 base.gateway.port = Number(internalPort);
 base.gateway.trustedProxies = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
@@ -198,8 +198,7 @@ let restartAttempt = 0;
 let startLoopId = 0;
 let restartScheduled = false;
 
-// Output ring buffer so we can show the last lines on /debug and on timeout
-const MAX_LOG_LINES = envInt("OPENCLAW_LOG_RING_MAX", 250);
+const MAX_LOG_LINES = envInt("OPENCLAW_LOG_RING_MAX", 300);
 const outRing = [];
 const errRing = [];
 
@@ -243,32 +242,30 @@ function scheduleRestart(waitMs) {
   }, waitMs);
 }
 
-// Railway often does NOT have `openclaw` on PATH,
-// but it WILL have `node_modules/.bin/openclaw` after install.
-// Also, your package.json says bin is openclaw.mjs, so `node openclaw.mjs` works too.
 function resolveOpenClawCommand() {
   const override = envStr("OPENCLAW_CMD", "").trim();
   if (override) {
     console.log("[railway-start] using OPENCLAW_CMD override:", override);
-    return { cmd: override.split(" ")[0], argsPrefix: override.split(" ").slice(1) };
+    const parts = override.split(" ").filter(Boolean);
+    return { kind: "direct", cmd: parts[0], argsPrefix: parts.slice(1) };
   }
 
   const localBin = path.resolve("node_modules", ".bin", "openclaw");
   if (fs.existsSync(localBin)) {
     console.log("[railway-start] found local openclaw bin:", localBin);
-    return { cmd: localBin, argsPrefix: [] };
+    return { kind: "localbin", cmd: localBin, argsPrefix: [] };
   }
 
   const entryMjs = path.resolve("openclaw.mjs");
   if (fs.existsSync(entryMjs)) {
     console.log("[railway-start] found openclaw.mjs:", entryMjs);
-    return { cmd: process.execPath, argsPrefix: [entryMjs] };
+    return { kind: "node", cmd: process.execPath, argsPrefix: [entryMjs] };
   }
 
   const distEntry = path.resolve("dist", "index.js");
   if (fs.existsSync(distEntry)) {
     console.log("[railway-start] found dist/index.js:", distEntry);
-    return { cmd: process.execPath, argsPrefix: [distEntry] };
+    return { kind: "node", cmd: process.execPath, argsPrefix: [distEntry] };
   }
 
   return null;
@@ -287,7 +284,6 @@ function buildOpenClawArgs(bindAddr) {
 }
 
 function currentBindForAttempt(attempt) {
-  // attempt 0,1 use primary. attempt 2+ use fallback. This gives it one retry before flipping.
   return attempt >= 2 ? bindFallback : bindPrimary;
 }
 
@@ -302,33 +298,66 @@ function spawnOpenClawProcess(bindAddr) {
   }
 
   const args = [...resolved.argsPrefix, ...buildOpenClawArgs(bindAddr)];
-  console.log("[railway-start] exec:", [resolved.cmd, ...args].join(" "));
 
+  if (resolved.kind === "localbin" && useShellForLocalBin) {
+    const cmdLine = [resolved.cmd, ...args].join(" ");
+    console.log("[railway-start] exec shell:", cmdLine);
+    return spawn(cmdLine, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: childEnv,
+      shell: true,
+    });
+  }
+
+  console.log("[railway-start] exec:", [resolved.cmd, ...args].join(" "));
   return spawn(resolved.cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
+}
+
+async function isPortReadyAnyHost() {
+  // Note: do not include 0.0.0.0 here. It is a bind address, not a connect target.
+  const hosts = ["127.0.0.1", "localhost", "::1"];
+  for (const h of hosts) {
+    // eslint-disable-next-line no-await-in-loop
+    const ok = await tcpCheck(h, internalPort, 700);
+    if (ok) return { ok: true, host: h };
+  }
+  return { ok: false, host: null };
 }
 
 async function waitForOpenClawTcpReady(timeoutMs, child) {
   const start = Date.now();
   const deadline = start + timeoutMs;
 
-  // Give the process a moment before first check so we do not false fail on ultra fast loops
-  await sleep(600);
+  await sleep(800);
 
   let lastLogAt = 0;
 
   while (Date.now() < deadline) {
-    // If the child already exited, stop waiting
-    if (child && child.exitCode != null) return false;
+    if (child && child.exitCode != null) {
+      console.log("[railway-start] child already exited while waiting, exitCode =", child.exitCode);
+      return false;
+    }
 
-    const ok = await tcpCheck("127.0.0.1", internalPort, 800);
-    if (ok) return true;
+    const r = await isPortReadyAnyHost();
+    if (r.ok) {
+      console.log("[railway-start] TCP ready on host", r.host, "port", internalPort);
+      return true;
+    }
 
     const now = Date.now();
     if (now - lastLogAt > 5000) {
       lastLogAt = now;
       const elapsed = now - start;
       const remaining = Math.max(0, deadline - now);
-      console.log("[railway-start] waiting for TCP on 127.0.0.1:" + internalPort, "elapsed", elapsed, "ms", "remaining", remaining, "ms");
+      console.log(
+        "[railway-start] waiting for TCP readiness",
+        "elapsed",
+        elapsed,
+        "ms",
+        "remaining",
+        remaining,
+        "ms"
+      );
     }
 
     await sleep(450);
@@ -353,7 +382,6 @@ async function startOpenClawLoop() {
   clawStarting = true;
   clawReady = false;
 
-  // Clear rings for this attempt so the timeout dump is relevant
   outRing.length = 0;
   errRing.length = 0;
 
@@ -393,6 +421,7 @@ async function startOpenClawLoop() {
         markReadyFromLine(ln);
       }
     });
+    claw.stdout.on("end", () => console.log("[railway-start] child stdout ended"));
   }
 
   if (claw.stderr) {
@@ -404,10 +433,14 @@ async function startOpenClawLoop() {
         markReadyFromLine(ln);
       }
     });
+    claw.stderr.on("end", () => console.log("[railway-start] child stderr ended"));
   }
 
   claw.on("exit", (code, signal) => {
     console.log("[railway-start] OpenClaw exited code:", code, "signal:", signal);
+
+    dumpRing("[railway-start][openclaw STDOUT]", outRing);
+    dumpRing("[railway-start][openclaw STDERR]", errRing);
 
     if (myLoopId !== startLoopId) {
       console.log("[railway-start] Superseded by newer start attempt, not restarting");
@@ -425,6 +458,9 @@ async function startOpenClawLoop() {
 
   claw.on("error", (err) => {
     console.error("[railway-start] OpenClaw process error:", err?.message || err);
+
+    dumpRing("[railway-start][openclaw STDOUT]", outRing);
+    dumpRing("[railway-start][openclaw STDERR]", errRing);
 
     if (myLoopId !== startLoopId) {
       console.log("[railway-start] Superseded, not restarting");
@@ -453,7 +489,6 @@ async function startOpenClawLoop() {
 
   if (!becameReady) {
     console.error("[railway-start] OpenClaw did not become TCP-ready in time, restarting");
-    // Dump last captured logs so we can see what it was doing
     dumpRing("[railway-start][openclaw STDOUT]", outRing);
     dumpRing("[railway-start][openclaw STDERR]", errRing);
 
@@ -477,6 +512,30 @@ async function startOpenClawLoop() {
 
 const proxyAgent = new http.Agent({ keepAlive: true });
 
+function normalizeToken(s) {
+  return String(s || "").trim();
+}
+
+function checkProxyToken(req) {
+  if (!enforceProxyToken) return { ok: true, reason: "disabled" };
+  if (!token) return { ok: false, reason: "missing-server-token" };
+
+  const hdr =
+    normalizeToken(req.headers["x-openclaw-token"]) ||
+    normalizeToken(req.headers["x-api-key"]) ||
+    "";
+
+  const auth = normalizeToken(req.headers["authorization"]);
+  const bearer =
+    auth.toLowerCase().startsWith("bearer ") ? normalizeToken(auth.slice(7)) : "";
+
+  const got = hdr || bearer;
+  if (!got) return { ok: false, reason: "missing-client-token" };
+  if (got !== token) return { ok: false, reason: "bad-client-token" };
+
+  return { ok: true, reason: "ok" };
+}
+
 function buildForwardedHeaders(req) {
   const remoteAddr = req.socket?.remoteAddress || "";
   const priorXff = req.headers["x-forwarded-for"];
@@ -485,8 +544,25 @@ function buildForwardedHeaders(req) {
   const xfProto = req.headers["x-forwarded-proto"] || "https";
   const xfHost = req.headers["x-forwarded-host"] || req.headers.host || "";
 
+  // Remove hop-by-hop headers that should not be forwarded.
+  const hopByHop = new Set([
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+  ]);
+
+  const cleaned = {};
+  for (const [k, v] of Object.entries(req.headers || {})) {
+    if (!hopByHop.has(String(k).toLowerCase())) cleaned[k] = v;
+  }
+
   return {
-    ...req.headers,
+    ...cleaned,
     "x-forwarded-proto": String(xfProto),
     "x-forwarded-host": String(xfHost),
     "x-forwarded-for": String(xff),
@@ -495,7 +571,8 @@ function buildForwardedHeaders(req) {
 
 async function isOpenClawReadyFast() {
   if (clawReady) return true;
-  return tcpCheck("127.0.0.1", internalPort, 600);
+  const r = await isPortReadyAnyHost();
+  return r.ok;
 }
 
 function serveJson(res, code, obj) {
@@ -506,6 +583,25 @@ function serveJson(res, code, obj) {
 
 const server = http.createServer(async (req, res) => {
   const url = req.url || "/";
+
+  // Optional: enforce a token at the proxy edge too (useful if OpenClaw gateway auth is off)
+  if (enforceProxyToken && url !== "/health" && url !== "/ready") {
+    const check = checkProxyToken(req);
+    if (!check.ok) {
+      res.statusCode = 401;
+      res.setHeader("content-type", "text/plain");
+      res.end("unauthorized");
+      return;
+    }
+  }
+
+  // Friendly root so Railway "open app" does not look broken
+  if (url === "/") {
+    res.statusCode = 200;
+    res.setHeader("content-type", "text/plain");
+    res.end("ok\n/health\n/ready\n/debug\n");
+    return;
+  }
 
   if (url === "/health") {
     res.statusCode = 200;
@@ -523,16 +619,18 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url === "/debug") {
-    const ok = await tcpCheck("127.0.0.1", internalPort, 900);
+    const r = await isPortReadyAnyHost();
     serveJson(res, 200, {
       externalPort,
       internalPort,
       clawReady,
       clawRunning: !!claw,
       clawPid: claw?.pid || null,
-      tcpCheck: ok,
+      tcpReady: r.ok,
+      tcpHost: r.host,
       stateDir,
       enforceTokenAuth,
+      enforceProxyToken,
       startupTimeoutMs,
       watchdogIntervalMs,
       proxyTimeoutMs,
@@ -541,8 +639,9 @@ const server = http.createServer(async (req, res) => {
       clawStarting,
       bindPrimary,
       bindFallback,
-      outTail: outRing.slice(-80),
-      errTail: errRing.slice(-80),
+      OPENCLAW_SHELL_LOCAL_BIN: useShellForLocalBin,
+      outTail: outRing.slice(-120),
+      errTail: errRing.slice(-120),
     });
     return;
   }
@@ -595,6 +694,16 @@ const server = http.createServer(async (req, res) => {
 
 server.on("upgrade", async (req, socket, head) => {
   try {
+    if (enforceProxyToken) {
+      const check = checkProxyToken(req);
+      if (!check.ok) {
+        try {
+          socket.destroy();
+        } catch {}
+        return;
+      }
+    }
+
     const isReady = await isOpenClawReadyFast();
     if (!isReady) {
       try {
@@ -645,15 +754,15 @@ server.on("upgrade", async (req, socket, head) => {
 
 server.listen(externalPort, "0.0.0.0", () => {
   console.log("[railway-start] public server listening on 0.0.0.0:" + externalPort);
-  console.log("[railway-start] endpoints: /health /ready /debug");
+  console.log("[railway-start] endpoints: / /health /ready /debug");
   console.log("[railway-start] proxying other routes to 127.0.0.1:" + internalPort);
 
   setTimeout(() => startOpenClawLoop(), 400);
 
   setInterval(async () => {
     if (!claw || clawStarting) return;
-    const ok = await tcpCheck("127.0.0.1", internalPort, 800);
-    if (ok) return;
+    const r = await isPortReadyAnyHost();
+    if (r.ok) return;
 
     console.error("[railway-start] watchdog: OpenClaw TCP down, restarting");
     dumpRing("[railway-start][openclaw STDOUT]", outRing);
