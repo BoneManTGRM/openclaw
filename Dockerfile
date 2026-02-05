@@ -1,31 +1,39 @@
-# Dockerfile (updated)
-# Fixes:
-# - Bun was installed under /root, but the container runs as USER node (bun often ends up unusable).
-# - Ensures pnpm is actually activated via corepack (some builds fail if pnpm isn’t prepared).
-# - Keeps your layer caching good (deps install before copying full repo).
-# - Leaves your start command as-is.
+# Dockerfile
+# Updates vs your current version
+# - Installs curl and ca-certificates (bun installer and many package installs need them)
+# - Runs bun install as the node user so ownership is correct and bun is usable at runtime
+# - Keeps pnpm via corepack, and preserves good layer caching
+# - Leaves your CMD the same
 
 FROM node:22-bookworm
 
 WORKDIR /app
 
-# Optional system packages (kept from your original)
+# System packages
 ARG OPENCLAW_DOCKER_APT_PACKAGES=""
-RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
-      apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $OPENCLAW_DOCKER_APT_PACKAGES && \
-      apt-get clean && \
-      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    fi
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      $OPENCLAW_DOCKER_APT_PACKAGES; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Enable corepack and activate pnpm explicitly
 ARG PNPM_VERSION=9.15.4
 RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
 
-# Install bun somewhere the node user can use
+# Bun install under the node user (so it is owned correctly and works at runtime)
 ENV BUN_INSTALL=/home/node/.bun
 ENV PATH="${BUN_INSTALL}/bin:${PATH}"
+RUN set -eux; \
+    mkdir -p /home/node/.bun; \
+    chown -R node:node /home/node
+
+USER node
 RUN curl -fsSL https://bun.sh/install | bash
+USER root
 
 # Copy only dependency manifests first (better Docker cache)
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
