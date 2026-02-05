@@ -417,7 +417,14 @@ function resolveOpenClawCommand() {
  * OpenClaw expects bind MODEs here, not IPs.
  */
 function buildOpenClawArgs(bindMode) {
-  const args = ["gateway", "--allow-unconfigured", "--bind", String(bindMode), "--port", String(internalPort)];
+  const args = [
+    "gateway",
+    "--allow-unconfigured",
+    "--bind",
+    String(bindMode),
+    "--port",
+    String(internalPort),
+  ];
 
   if (forceEnabled) {
     args.push("--force");
@@ -461,6 +468,7 @@ function spawnOpenClawProcess(bindMode) {
 async function isPortReadyAnyHost() {
   const hosts = ["127.0.0.1", "localhost", "::1"];
   for (const h of hosts) {
+    // eslint-disable-next-line no-await-in-loop
     const ok = await tcpCheck(h, internalPort, 700);
     if (ok) return { ok: true, host: h };
   }
@@ -492,7 +500,15 @@ async function waitForOpenClawTcpReady(timeoutMs, child) {
       lastLogAt = now;
       const elapsed = now - start;
       const remaining = Math.max(0, deadline - now);
-      console.log("[railway-start] waiting for TCP readiness", "elapsed", elapsed, "ms", "remaining", remaining, "ms");
+      console.log(
+        "[railway-start] waiting for TCP readiness",
+        "elapsed",
+        elapsed,
+        "ms",
+        "remaining",
+        remaining,
+        "ms"
+      );
     }
 
     await sleep(450);
@@ -656,7 +672,10 @@ function checkProxyToken(req) {
   if (!enforceProxyToken) return { ok: true, reason: "disabled" };
   if (!token) return { ok: false, reason: "missing-server-token" };
 
-  const hdr = normalizeToken(req.headers["x-openclaw-token"]) || normalizeToken(req.headers["x-api-key"]) || "";
+  const hdr =
+    normalizeToken(req.headers["x-openclaw-token"]) ||
+    normalizeToken(req.headers["x-api-key"]) ||
+    "";
 
   const auth = normalizeToken(req.headers["authorization"]);
   const bearer = auth.toLowerCase().startsWith("bearer ") ? normalizeToken(auth.slice(7)) : "";
@@ -730,9 +749,22 @@ function buildForwardedHeaders(req) {
     (req.socket?.encrypted ? "https" : "http");
 
   const xfHost =
-    forwardedHostOverride || req.headers[H_XFH] || req.headers["x-forwarded-host"] || req.headers.host || "";
+    forwardedHostOverride ||
+    req.headers[H_XFH] ||
+    req.headers["x-forwarded-host"] ||
+    req.headers.host ||
+    "";
 
-  const hopByHop = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade"]);
+  const hopByHop = new Set([
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+  ]);
 
   const cleaned = {};
   for (const [k, v] of Object.entries(req.headers || {})) {
@@ -885,7 +917,13 @@ if (openclawListenOnExternal) {
   const server = http.createServer(async (req, res) => {
     const url = req.url || "/";
 
-    if (enforceProxyToken && url !== "/health" && url !== "/ready" && url !== "/debug" && !isPublicUiPath(url)) {
+    if (
+      enforceProxyToken &&
+      url !== "/health" &&
+      url !== "/ready" &&
+      url !== "/debug" &&
+      !isPublicUiPath(url)
+    ) {
       const check = checkProxyToken(req);
       if (!check.ok) return serveText(res, 401, "unauthorized");
     }
@@ -1004,7 +1042,9 @@ if (openclawListenOnExternal) {
 
       upstreamReq.on("upgrade", (upstreamRes, upstreamSocket) => {
         const lines = [
-          `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage || ""}`.trim(),
+          `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${
+            upstreamRes.statusMessage || ""
+          }`.trim(),
           ...Object.entries(upstreamRes.headers).map(([k, v]) => `${k}: ${v}`),
           "",
           "",
@@ -1047,7 +1087,10 @@ if (openclawListenOnExternal) {
     console.log("[railway-start] endpoints: /health /ready /debug");
     console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
     if (proxyEnabled) {
-      console.log("[railway-start] proxying other routes to", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
+      console.log(
+        "[railway-start] proxying other routes to",
+        `${upstreamProtocol}://${upstreamHost}:${internalPort}`
+      );
     }
 
     setTimeout(() => startOpenClawLoop(), 400);
