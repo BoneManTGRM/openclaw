@@ -1,11 +1,84 @@
+# VCS
 .git
+.gitignore
+.gitattributes
+.github/
+.gitlab/
 .worktrees
-.bun-cache
-.bun
-.tmp
-**/.tmp
+.svn/
+.hg/
+
+# OS junk
 .DS_Store
 **/.DS_Store
+Thumbs.db
+**/Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Local env and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp
+.tmp
+**/.tmp
+tmp
+**/tmp
+temp
+**/temp
+
+# Package manager caches
+.bun
+.bun-cache
+.pnpm-store
+**/.pnpm-store
+.npm/
+.yarn/
+.yarn-cache
+**/.yarn-cache
+
+# Dependencies
+node_modules
+**/node_modules
+
+# Build caches / outputs
+.turbo
+**/.turbo
+.cache
+**/.cache
+.next
+**/.next
+coverage
+**/coverage
+dist
+**/dist
+build
+**/build
+out
+**/out
+*.trace
+**/*.trace
+
+# Media assets (keep images out of Docker context by default)
 *.png
 *.jpg
 *.jpeg
@@ -15,30 +88,12 @@
 *.mov
 *.wav
 *.mp3
-node_modules
-**/node_modules
-.pnpm-store
-**/.pnpm-store
-.turbo
-**/.turbo
-.cache
-**/.cache
-.next
-**/.next
-coverage
-**/coverage
-*.log
-tmp
-**/tmp
 
-# build artifacts
-dist
-**/dist
-apps/macos/.build
-apps/ios/build
-**/*.trace
+# OpenClaw runtime state (must be created at runtime, not baked into image)
+.openclaw/
+**/.openclaw
 
-# large app trees not needed for CLI build
+# Large app trees not needed for CLI/server image
 apps/
 assets/
 Peekaboo/
@@ -46,3 +101,23 @@ Swabble/
 Core/
 Users/
 vendor/
+
+# Mac/iOS build artifacts
+apps/macos/.build
+apps/ios/build
+**/*.xcworkspace
+**/*.xcodeproj
+**/*.ipa
+**/*.dSYM
+**/*.framework
+
+# Docker artifacts
+Dockerfile*
+docker-compose*.yml
+
+# Docs (optional, keeps image context smaller)
+*.pdf
+*.psd
+*.ai
+*.sketch
+*.fig
