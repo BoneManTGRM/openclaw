@@ -17,8 +17,10 @@ function envBool(name, defaultValue = false) {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+// FIX: empty string should not become 0
 function envInt(name, fallback) {
-  const raw = String(process.env[name] || "").trim();
+  const raw = String(process.env[name] ?? "").trim();
+  if (raw.length === 0) return fallback;
   const n = Number(raw);
   return Number.isFinite(n) ? n : fallback;
 }
@@ -118,7 +120,9 @@ const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
 // Railway cold starts can be slow
-const startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 90000);
+let startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 90000);
+// prevent 0ms (or silly small values) from instantly killing the child
+startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
 
 const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
 const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
@@ -149,6 +153,7 @@ console.log("[railway-start] internal OpenClaw port =", internalPort);
 console.log("[railway-start] chosen stateDir =", stateDir);
 console.log("[railway-start] token present =", token ? "yes" : "no");
 console.log("[railway-start] enforce token auth =", enforceTokenAuth ? "yes" : "no");
+console.log("[railway-start] startupTimeoutMs =", startupTimeoutMs);
 
 safeMkdir(stateDir);
 
@@ -215,8 +220,7 @@ function scheduleRestart(waitMs) {
   }, waitMs);
 }
 
-// This is the key fix:
-// Railway often does NOT have `openclaw` on PATH for `which openclaw`,
+// Railway often does NOT have `openclaw` on PATH,
 // but it WILL have `node_modules/.bin/openclaw` after install.
 // Also, your package.json says bin is openclaw.mjs, so `node openclaw.mjs` works too.
 function resolveOpenClawCommand() {
@@ -238,7 +242,6 @@ function resolveOpenClawCommand() {
     return { cmd: process.execPath, argsPrefix: [entryMjs] };
   }
 
-  // Last resort: dist/index.js
   const distEntry = path.resolve("dist", "index.js");
   if (fs.existsSync(distEntry)) {
     console.log("[railway-start] found dist/index.js:", distEntry);
@@ -253,11 +256,11 @@ function spawnOpenClawProcess() {
 
   const resolved = resolveOpenClawCommand();
   if (!resolved) {
-    throw new Error("Could not find OpenClaw entry. Missing node_modules/.bin/openclaw, openclaw.mjs, and dist/index.js.");
+    throw new Error(
+      "Could not find OpenClaw entry. Missing node_modules/.bin/openclaw, openclaw.mjs, and dist/index.js."
+    );
   }
 
-  // Use the known working CLI form you already used earlier: `openclaw gateway --force`
-  // Keep your port and bind.
   const args = [
     ...resolved.argsPrefix,
     "gateway",
@@ -271,12 +274,16 @@ function spawnOpenClawProcess() {
 
   console.log("[railway-start] exec:", [resolved.cmd, ...args].join(" "));
 
-  // Pipe logs so we can actually see why it fails.
   return spawn(resolved.cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
 }
 
+// OPTIONAL: ensure we always do at least one check even if time math is weird
 async function waitForOpenClawTcpReady(timeoutMs) {
   const start = Date.now();
+
+  const firstOk = await tcpCheck("127.0.0.1", internalPort, 700);
+  if (firstOk) return true;
+
   while (Date.now() - start < timeoutMs) {
     const ok = await tcpCheck("127.0.0.1", internalPort, 700);
     if (ok) return true;
