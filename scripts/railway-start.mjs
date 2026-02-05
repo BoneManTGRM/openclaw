@@ -8,8 +8,9 @@
 //    In that mode, OpenClaw serves everything including health.
 // 3) Ensures https-only options are only passed to https.request (rejectUnauthorized).
 // 4) Keeps your default behavior unchanged: wrapper listens on PORT and proxies to OpenClaw on 8081.
-// 5) Fixes "trusted proxies" not taking effect in some builds by ALSO writing gateway.trustProxy / trustProxy.
-// 6) Adds optional one-time pairing bypass via OPENCLAW_PAIRING_REQUIRED=0 (only if your OpenClaw build supports it).
+// 5) Fixes pairing-required websocket closes caused by "untrusted proxy headers" by writing ONLY the
+//    currently valid OpenClaw config key: gateway.trustedProxies
+//    (and NOT writing invalid keys like trustProxy/trustProxies/pairingRequired which crash newer builds).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -88,14 +89,18 @@ function canWriteDir(dir) {
 function parseTrustedProxies() {
   const override = String(process.env.OPENCLAW_TRUSTED_PROXIES || "").trim();
   const base = [
+    // Common private ranges
     "100.64.0.0/10",
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
+    // Localhost
     "127.0.0.1/32",
     "::1/128",
   ];
-  const extra = override ? override.split(",").map((s) => s.trim()).filter(Boolean) : [];
+  const extra = override
+    ? override.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
   return uniq([...base, ...extra]);
 }
 
@@ -140,7 +145,7 @@ const externalPort = envInt("PORT", 8080);
 const internalPortDefault = envInt("OPENCLAW_INTERNAL_PORT", 8081);
 
 // If OPENCLAW_LISTEN_ON_EXTERNAL=1, OpenClaw binds to externalPort.
-// Important: in that mode this wrapper MUST NOT bind to externalPort, or you get EADDRINUSE.
+// In that mode this wrapper MUST NOT bind to externalPort, or you get EADDRINUSE.
 const openclawListenOnExternal = envBool("OPENCLAW_LISTEN_ON_EXTERNAL", false);
 
 const internalPort = openclawListenOnExternal ? externalPort : internalPortDefault;
@@ -165,8 +170,6 @@ const forwardedHostOverride = envStr("OPENCLAW_FORWARDED_HOST", "");
 
 /**
  * OpenClaw `gateway --bind` expects a MODE, not an IP.
- * Valid modes vary by build, common ones include:
- * loopback, tailnet, lan, auto, custom
  */
 const bindPrimary = envStr("OPENCLAW_BIND", "loopback");
 const bindFallback = envStr("OPENCLAW_BIND_FALLBACK", "lan");
@@ -182,10 +185,6 @@ const proxyEnabled = envBool("OPENCLAW_PROXY_ENABLED", !openclawListenOnExternal
 // Use --force only if explicitly requested AND lsof exists.
 const forceRequested = envBool("OPENCLAW_FORCE", false);
 const forceEnabled = forceRequested && hasWorkingLsof();
-
-// Some builds support a pairing toggle; keep it opt-in and default to required.
-// If your build ignores it, no harm done.
-const pairingRequired = envBool("OPENCLAW_PAIRING_REQUIRED", true);
 
 const candidates = [
   process.env.OPENCLAW_STATE_DIR,
@@ -220,7 +219,6 @@ console.log("[railway-start] bindPrimary =", bindPrimary, "bindFallback =", bind
 console.log("[railway-start] OPENCLAW_SHELL_LOCAL_BIN =", useShellForLocalBin ? "yes" : "no");
 console.log("[railway-start] OpenClaw force requested =", forceRequested ? "yes" : "no");
 console.log("[railway-start] OpenClaw force enabled =", forceEnabled ? "yes" : "no");
-console.log("[railway-start] pairingRequired =", pairingRequired ? "yes" : "no");
 console.log("[railway-start] upstream =", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
 
 safeMkdir(stateDir);
@@ -228,28 +226,30 @@ safeMkdir(stateDir);
 const configA = path.join(stateDir, "openclaw.json");
 const configB = path.join(stateDir, "config.json");
 
+// Read existing config (if any) and normalize to only supported keys.
+// Newer OpenClaw builds reject keys like trustProxy/trustProxies/pairingRequired at root or gateway.
 const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 base.gateway = base.gateway || {};
 
 // Ensure port is correct for whichever mode we are in
 base.gateway.port = Number(internalPort);
 
-// Trusted proxies (your original)
-// Some builds look for different keys. We write all common variants.
+// Trusted proxies
+// IMPORTANT: only write the currently valid key: gateway.trustedProxies
 const trusted = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
   ...parseTrustedProxies(),
 ]);
 base.gateway.trustedProxies = trusted;
-base.gateway.trustProxy = true;
-base.gateway.trustProxies = trusted;
 
-// Some builds use top-level trustProxy settings (rare, but safe)
-base.trustProxy = true;
-base.trustedProxies = uniq([...(Array.isArray(base.trustedProxies) ? base.trustedProxies : []), ...trusted]);
-
-// Pairing requirement toggle if supported by build
-base.gateway.pairingRequired = pairingRequired;
+// Strip known-invalid keys (prevents boot crash on strict schema builds)
+delete base.trustProxy;
+delete base.trustedProxies;
+if (base.gateway) {
+  delete base.gateway.trustProxy;
+  delete base.gateway.trustProxies;
+  delete base.gateway.pairingRequired;
+}
 
 // Gateway auth (token) optional
 if (enforceTokenAuth && token) {
@@ -836,7 +836,7 @@ if (openclawListenOnExternal) {
         OPENCLAW_SHELL_LOCAL_BIN: useShellForLocalBin,
         OPENCLAW_FORCE: forceRequested,
         OPENCLAW_FORCE_ENABLED: forceEnabled,
-        OPENCLAW_PAIRING_REQUIRED: pairingRequired,
+        trustedProxies: trusted,
         outTail: outRing.slice(-120),
         errTail: errRing.slice(-120),
       });
