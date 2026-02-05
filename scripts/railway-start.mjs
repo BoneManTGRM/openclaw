@@ -124,8 +124,14 @@ startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
 const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
 const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
 
-const bindPrimary = envStr("OPENCLAW_BIND", "127.0.0.1");
-const bindFallback = envStr("OPENCLAW_BIND_FALLBACK", "0.0.0.0");
+/**
+ * IMPORTANT:
+ * OpenClaw `gateway --bind` expects a MODE, not an IP.
+ * Valid modes include: loopback, tailnet, lan, auto, custom
+ * (See OpenClaw docs for the full list and meaning)
+ */
+const bindPrimary = envStr("OPENCLAW_BIND", "loopback");
+const bindFallback = envStr("OPENCLAW_BIND_FALLBACK", "lan");
 
 const useShellForLocalBin = envBool("OPENCLAW_SHELL_LOCAL_BIN", true);
 
@@ -271,13 +277,16 @@ function resolveOpenClawCommand() {
   return null;
 }
 
-function buildOpenClawArgs(bindAddr) {
+/**
+ * OpenClaw expects bind MODEs here, not IPs.
+ */
+function buildOpenClawArgs(bindMode) {
   return [
     "gateway",
     "--force",
     "--allow-unconfigured",
     "--bind",
-    String(bindAddr),
+    String(bindMode),
     "--port",
     String(internalPort),
   ];
@@ -287,7 +296,7 @@ function currentBindForAttempt(attempt) {
   return attempt >= 2 ? bindFallback : bindPrimary;
 }
 
-function spawnOpenClawProcess(bindAddr) {
+function spawnOpenClawProcess(bindMode) {
   const childEnv = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
 
   const resolved = resolveOpenClawCommand();
@@ -297,7 +306,7 @@ function spawnOpenClawProcess(bindAddr) {
     );
   }
 
-  const args = [...resolved.argsPrefix, ...buildOpenClawArgs(bindAddr)];
+  const args = [...resolved.argsPrefix, ...buildOpenClawArgs(bindMode)];
 
   if (resolved.kind === "localbin" && useShellForLocalBin) {
     const cmdLine = [resolved.cmd, ...args].join(" ");
@@ -385,11 +394,11 @@ async function startOpenClawLoop() {
   outRing.length = 0;
   errRing.length = 0;
 
-  const bindAddr = currentBindForAttempt(restartAttempt);
-  console.log("[railway-start] starting attempt", restartAttempt + 1, "bind =", bindAddr);
+  const bindMode = currentBindForAttempt(restartAttempt);
+  console.log("[railway-start] starting attempt", restartAttempt + 1, "bind =", bindMode);
 
   try {
-    claw = spawnOpenClawProcess(bindAddr);
+    claw = spawnOpenClawProcess(bindMode);
     console.log("[railway-start] OpenClaw spawned PID:", claw.pid);
   } catch (e) {
     console.error("[railway-start] Failed to spawn OpenClaw:", e?.message || e);
