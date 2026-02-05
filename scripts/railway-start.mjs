@@ -13,8 +13,9 @@
 //    (and NOT writing invalid keys like trustProxy/trustProxies/pairingRequired which crash newer builds).
 // 6) Adds "self sanitize" mode (default on): writes a minimal strict config that cannot contain unknown keys.
 //    Toggle with OPENCLAW_SELF_SANITIZE=0 if you want to preserve extra keys from an existing config.
-// 7) SELF SANITIZE PROXY HEADERS (updated): when selfSanitize is on, strip any client-supplied proxy headers,
-//    then add back a clean forwarded set expected by OpenClaw. This avoids the pairing-required loop.
+// 7) SELF SANITIZE PROXY HEADERS (updated again): when selfSanitize is on, strip all client-supplied
+//    proxy-derived headers AND do not add x-forwarded-* back. This prevents OpenClaw from seeing any
+//    proxy headers at all, which stops the "Proxy headers detected from untrusted address" loop on Railway.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -774,15 +775,17 @@ function buildForwardedHeaders(req) {
   // Always preserve host
   cleaned.host = xfHost;
 
-  // Self sanitize: strip any incoming proxy-derived headers, then add back a clean set OpenClaw expects.
+  // Self sanitize: strip any incoming proxy-derived headers and do NOT add any forwarded headers back.
+  // This is the key change that stops OpenClaw from detecting proxy headers as "untrusted" on Railway.
   if (selfSanitize) {
     const stripped = stripProxyDerivedHeaders(cleaned);
 
-    stripped[H_XFP] = String(xfProto);
-    stripped[H_XFH] = String(xfHost);
-    stripped[H_XFPORT] = String(externalPort);
-    stripped[H_XFF] = String(xff);
-    stripped[H_XREAL] = String(remoteAddr);
+    // Keep a stable host header only
+    stripped.host = xfHost || stripped.host || "";
+
+    // Do not set:
+    // stripped[H_XFP], stripped[H_XFH], stripped[H_XFPORT], stripped[H_XFF], stripped[H_XREAL]
+    // so OpenClaw sees a plain local hop with no proxy metadata.
 
     return stripped;
   }
@@ -793,6 +796,8 @@ function buildForwardedHeaders(req) {
     [H_XFP]: String(xfProto),
     [H_XFH]: String(xfHost),
     [H_XFF]: String(xff),
+    [H_XREAL]: String(remoteAddr),
+    [H_XFPORT]: String(externalPort),
   };
 }
 
