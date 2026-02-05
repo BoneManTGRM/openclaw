@@ -13,6 +13,8 @@
 //    (and NOT writing invalid keys like trustProxy/trustProxies/pairingRequired which crash newer builds).
 // 6) Adds "self sanitize" mode (default on): writes a minimal strict config that cannot contain unknown keys.
 //    Toggle with OPENCLAW_SELF_SANITIZE=0 if you want to preserve extra keys from an existing config.
+// 7) SELF SANITIZE PROXY HEADERS (this is the missing piece): when selfSanitize is on, do NOT forward
+//    x-forwarded-* / forwarded / real-ip headers into OpenClaw. This stops the pairing-required loop.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -695,6 +697,36 @@ function isPublicUiPath(url) {
   return false;
 }
 
+// Headers that trigger OpenClaw proxy detection and cause pairing required loops behind Railway.
+const PROXY_DERIVED_HEADERS = new Set([
+  "forwarded",
+  "x-forwarded-for",
+  "x-forwarded-proto",
+  "x-forwarded-host",
+  "x-forwarded-port",
+  "x-forwarded-server",
+  "x-forwarded-ssl",
+  "x-forwarded-scheme",
+  "x-forwarded-prefix",
+  "x-original-forwarded-for",
+  "x-real-ip",
+  "true-client-ip",
+  "cf-connecting-ip",
+  "fastly-client-ip",
+  "x-client-ip",
+  "x-cluster-client-ip",
+]);
+
+function stripProxyDerivedHeaders(headersObj) {
+  const out = {};
+  for (const [k, v] of Object.entries(headersObj || {})) {
+    const lk = String(k).toLowerCase();
+    if (PROXY_DERIVED_HEADERS.has(lk)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 function buildForwardedHeaders(req) {
   const remoteAddr = req.socket?.remoteAddress || "";
   const priorXff = req.headers["x-forwarded-for"];
@@ -723,8 +755,16 @@ function buildForwardedHeaders(req) {
     if (!hopByHop.has(String(k).toLowerCase())) cleaned[k] = v;
   }
 
+  // Always preserve host
   cleaned.host = xfHost;
 
+  // Self sanitize behavior that actually fixes the pairing required loop:
+  // do not forward any proxy derived headers into OpenClaw.
+  if (selfSanitize) {
+    return stripProxyDerivedHeaders(cleaned);
+  }
+
+  // Normal mode: forward proxy headers (may require trustedProxies to avoid pairing).
   return {
     ...cleaned,
     "x-forwarded-proto": String(xfProto),
