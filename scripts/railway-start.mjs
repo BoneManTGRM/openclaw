@@ -8,6 +8,8 @@
 //    In that mode, OpenClaw serves everything including health.
 // 3) Ensures https-only options are only passed to https.request (rejectUnauthorized).
 // 4) Keeps your default behavior unchanged: wrapper listens on PORT and proxies to OpenClaw on 8081.
+// 5) Fixes "trusted proxies" not taking effect in some builds by ALSO writing gateway.trustProxy / trustProxy.
+// 6) Adds optional one-time pairing bypass via OPENCLAW_PAIRING_REQUIRED=0 (only if your OpenClaw build supports it).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -139,7 +141,6 @@ const internalPortDefault = envInt("OPENCLAW_INTERNAL_PORT", 8081);
 
 // If OPENCLAW_LISTEN_ON_EXTERNAL=1, OpenClaw binds to externalPort.
 // Important: in that mode this wrapper MUST NOT bind to externalPort, or you get EADDRINUSE.
-// So we skip creating the wrapper server entirely.
 const openclawListenOnExternal = envBool("OPENCLAW_LISTEN_ON_EXTERNAL", false);
 
 const internalPort = openclawListenOnExternal ? externalPort : internalPortDefault;
@@ -182,6 +183,10 @@ const proxyEnabled = envBool("OPENCLAW_PROXY_ENABLED", !openclawListenOnExternal
 const forceRequested = envBool("OPENCLAW_FORCE", false);
 const forceEnabled = forceRequested && hasWorkingLsof();
 
+// Some builds support a pairing toggle; keep it opt-in and default to required.
+// If your build ignores it, no harm done.
+const pairingRequired = envBool("OPENCLAW_PAIRING_REQUIRED", true);
+
 const candidates = [
   process.env.OPENCLAW_STATE_DIR,
   "/data/.openclaw",
@@ -215,6 +220,7 @@ console.log("[railway-start] bindPrimary =", bindPrimary, "bindFallback =", bind
 console.log("[railway-start] OPENCLAW_SHELL_LOCAL_BIN =", useShellForLocalBin ? "yes" : "no");
 console.log("[railway-start] OpenClaw force requested =", forceRequested ? "yes" : "no");
 console.log("[railway-start] OpenClaw force enabled =", forceEnabled ? "yes" : "no");
+console.log("[railway-start] pairingRequired =", pairingRequired ? "yes" : "no");
 console.log("[railway-start] upstream =", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
 
 safeMkdir(stateDir);
@@ -225,12 +231,27 @@ const configB = path.join(stateDir, "config.json");
 const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 base.gateway = base.gateway || {};
 
+// Ensure port is correct for whichever mode we are in
 base.gateway.port = Number(internalPort);
-base.gateway.trustedProxies = uniq([
+
+// Trusted proxies (your original)
+// Some builds look for different keys. We write all common variants.
+const trusted = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
   ...parseTrustedProxies(),
 ]);
+base.gateway.trustedProxies = trusted;
+base.gateway.trustProxy = true;
+base.gateway.trustProxies = trusted;
 
+// Some builds use top-level trustProxy settings (rare, but safe)
+base.trustProxy = true;
+base.trustedProxies = uniq([...(Array.isArray(base.trustedProxies) ? base.trustedProxies : []), ...trusted]);
+
+// Pairing requirement toggle if supported by build
+base.gateway.pairingRequired = pairingRequired;
+
+// Gateway auth (token) optional
 if (enforceTokenAuth && token) {
   base.gateway.auth = base.gateway.auth || {};
   base.gateway.auth.mode = "token";
@@ -765,7 +786,6 @@ if (openclawListenOnExternal) {
 
   // Keep Node alive even if OpenClaw exits immediately and restarts are scheduled
   setInterval(() => {}, 1 << 30).unref();
-
 } else {
   const server = http.createServer(async (req, res) => {
     const url = req.url || "/";
@@ -816,6 +836,7 @@ if (openclawListenOnExternal) {
         OPENCLAW_SHELL_LOCAL_BIN: useShellForLocalBin,
         OPENCLAW_FORCE: forceRequested,
         OPENCLAW_FORCE_ENABLED: forceEnabled,
+        OPENCLAW_PAIRING_REQUIRED: pairingRequired,
         outTail: outRing.slice(-120),
         errTail: errRing.slice(-120),
       });
