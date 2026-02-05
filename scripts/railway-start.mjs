@@ -120,12 +120,18 @@ const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
 // Railway cold starts can be slow
-let startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 90000);
-// prevent 0ms (or silly small values) from instantly killing the child
+let startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 120000);
+// prevent 0ms (or tiny values) from instantly killing the child
 startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
 
 const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
 const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
+
+// Bind behavior:
+// Some builds only reliably listen when bind is 0.0.0.0.
+// We try 127.0.0.1 first, then auto flip after a failed attempt.
+const bindPrimary = envStr("OPENCLAW_BIND", "127.0.0.1");
+const bindFallback = envStr("OPENCLAW_BIND_FALLBACK", "0.0.0.0");
 
 // Prefer /tmp on Railway unless user explicitly sets OPENCLAW_STATE_DIR
 const candidates = [
@@ -154,6 +160,7 @@ console.log("[railway-start] chosen stateDir =", stateDir);
 console.log("[railway-start] token present =", token ? "yes" : "no");
 console.log("[railway-start] enforce token auth =", enforceTokenAuth ? "yes" : "no");
 console.log("[railway-start] startupTimeoutMs =", startupTimeoutMs);
+console.log("[railway-start] bindPrimary =", bindPrimary, "bindFallback =", bindFallback);
 
 safeMkdir(stateDir);
 
@@ -190,6 +197,22 @@ let clawReady = false;
 let restartAttempt = 0;
 let startLoopId = 0;
 let restartScheduled = false;
+
+// Output ring buffer so we can show the last lines on /debug and on timeout
+const MAX_LOG_LINES = envInt("OPENCLAW_LOG_RING_MAX", 250);
+const outRing = [];
+const errRing = [];
+
+function pushRing(arr, line) {
+  arr.push(line);
+  while (arr.length > MAX_LOG_LINES) arr.shift();
+}
+
+function dumpRing(label, arr) {
+  if (!arr.length) return;
+  console.log(label, "last", arr.length, "lines");
+  for (const ln of arr) console.log(label, ln);
+}
 
 function computeBackoffMs(attempt) {
   const a = clamp(attempt, 0, 8);
@@ -251,7 +274,24 @@ function resolveOpenClawCommand() {
   return null;
 }
 
-function spawnOpenClawProcess() {
+function buildOpenClawArgs(bindAddr) {
+  return [
+    "gateway",
+    "--force",
+    "--allow-unconfigured",
+    "--bind",
+    String(bindAddr),
+    "--port",
+    String(internalPort),
+  ];
+}
+
+function currentBindForAttempt(attempt) {
+  // attempt 0,1 use primary. attempt 2+ use fallback. This gives it one retry before flipping.
+  return attempt >= 2 ? bindFallback : bindPrimary;
+}
+
+function spawnOpenClawProcess(bindAddr) {
   const childEnv = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
 
   const resolved = resolveOpenClawCommand();
@@ -261,34 +301,39 @@ function spawnOpenClawProcess() {
     );
   }
 
-  const args = [
-    ...resolved.argsPrefix,
-    "gateway",
-    "--force",
-    "--allow-unconfigured",
-    "--bind",
-    "127.0.0.1",
-    "--port",
-    String(internalPort),
-  ];
-
+  const args = [...resolved.argsPrefix, ...buildOpenClawArgs(bindAddr)];
   console.log("[railway-start] exec:", [resolved.cmd, ...args].join(" "));
 
   return spawn(resolved.cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
 }
 
-// OPTIONAL: ensure we always do at least one check even if time math is weird
-async function waitForOpenClawTcpReady(timeoutMs) {
+async function waitForOpenClawTcpReady(timeoutMs, child) {
   const start = Date.now();
+  const deadline = start + timeoutMs;
 
-  const firstOk = await tcpCheck("127.0.0.1", internalPort, 700);
-  if (firstOk) return true;
+  // Give the process a moment before first check so we do not false fail on ultra fast loops
+  await sleep(600);
 
-  while (Date.now() - start < timeoutMs) {
-    const ok = await tcpCheck("127.0.0.1", internalPort, 700);
+  let lastLogAt = 0;
+
+  while (Date.now() < deadline) {
+    // If the child already exited, stop waiting
+    if (child && child.exitCode != null) return false;
+
+    const ok = await tcpCheck("127.0.0.1", internalPort, 800);
     if (ok) return true;
-    await sleep(350);
+
+    const now = Date.now();
+    if (now - lastLogAt > 5000) {
+      lastLogAt = now;
+      const elapsed = now - start;
+      const remaining = Math.max(0, deadline - now);
+      console.log("[railway-start] waiting for TCP on 127.0.0.1:" + internalPort, "elapsed", elapsed, "ms", "remaining", remaining, "ms");
+    }
+
+    await sleep(450);
   }
+
   return false;
 }
 
@@ -308,8 +353,15 @@ async function startOpenClawLoop() {
   clawStarting = true;
   clawReady = false;
 
+  // Clear rings for this attempt so the timeout dump is relevant
+  outRing.length = 0;
+  errRing.length = 0;
+
+  const bindAddr = currentBindForAttempt(restartAttempt);
+  console.log("[railway-start] starting attempt", restartAttempt + 1, "bind =", bindAddr);
+
   try {
-    claw = spawnOpenClawProcess();
+    claw = spawnOpenClawProcess(bindAddr);
     console.log("[railway-start] OpenClaw spawned PID:", claw.pid);
   } catch (e) {
     console.error("[railway-start] Failed to spawn OpenClaw:", e?.message || e);
@@ -332,21 +384,27 @@ async function startOpenClawLoop() {
     }
   };
 
-  claw.stdout.on("data", (data) => {
-    const lines = data.toString().split("\n").filter(Boolean);
-    for (const ln of lines) {
-      console.log("[openclaw]", ln);
-      markReadyFromLine(ln);
-    }
-  });
+  if (claw.stdout) {
+    claw.stdout.on("data", (data) => {
+      const lines = data.toString().split("\n").map((x) => x.trimEnd()).filter(Boolean);
+      for (const ln of lines) {
+        pushRing(outRing, ln);
+        console.log("[openclaw]", ln);
+        markReadyFromLine(ln);
+      }
+    });
+  }
 
-  claw.stderr.on("data", (data) => {
-    const lines = data.toString().split("\n").filter(Boolean);
-    for (const ln of lines) {
-      console.error("[openclaw ERROR]", ln);
-      markReadyFromLine(ln);
-    }
-  });
+  if (claw.stderr) {
+    claw.stderr.on("data", (data) => {
+      const lines = data.toString().split("\n").map((x) => x.trimEnd()).filter(Boolean);
+      for (const ln of lines) {
+        pushRing(errRing, ln);
+        console.error("[openclaw ERROR]", ln);
+        markReadyFromLine(ln);
+      }
+    });
+  }
 
   claw.on("exit", (code, signal) => {
     console.log("[railway-start] OpenClaw exited code:", code, "signal:", signal);
@@ -386,7 +444,7 @@ async function startOpenClawLoop() {
     scheduleRestart(waitMs);
   });
 
-  const becameReady = await waitForOpenClawTcpReady(startupTimeoutMs);
+  const becameReady = await waitForOpenClawTcpReady(startupTimeoutMs, claw);
 
   if (myLoopId !== startLoopId) {
     clawStarting = false;
@@ -395,6 +453,10 @@ async function startOpenClawLoop() {
 
   if (!becameReady) {
     console.error("[railway-start] OpenClaw did not become TCP-ready in time, restarting");
+    // Dump last captured logs so we can see what it was doing
+    dumpRing("[railway-start][openclaw STDOUT]", outRing);
+    dumpRing("[railway-start][openclaw STDERR]", errRing);
+
     const child = claw;
     claw = null;
     clawReady = false;
@@ -433,7 +495,7 @@ function buildForwardedHeaders(req) {
 
 async function isOpenClawReadyFast() {
   if (clawReady) return true;
-  return tcpCheck("127.0.0.1", internalPort, 500);
+  return tcpCheck("127.0.0.1", internalPort, 600);
 }
 
 function serveJson(res, code, obj) {
@@ -461,7 +523,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url === "/debug") {
-    const ok = await tcpCheck("127.0.0.1", internalPort, 800);
+    const ok = await tcpCheck("127.0.0.1", internalPort, 900);
     serveJson(res, 200, {
       externalPort,
       internalPort,
@@ -477,6 +539,10 @@ const server = http.createServer(async (req, res) => {
       restartAttempt,
       restartScheduled,
       clawStarting,
+      bindPrimary,
+      bindFallback,
+      outTail: outRing.slice(-80),
+      errTail: errRing.slice(-80),
     });
     return;
   }
@@ -586,10 +652,13 @@ server.listen(externalPort, "0.0.0.0", () => {
 
   setInterval(async () => {
     if (!claw || clawStarting) return;
-    const ok = await tcpCheck("127.0.0.1", internalPort, 700);
+    const ok = await tcpCheck("127.0.0.1", internalPort, 800);
     if (ok) return;
 
     console.error("[railway-start] watchdog: OpenClaw TCP down, restarting");
+    dumpRing("[railway-start][openclaw STDOUT]", outRing);
+    dumpRing("[railway-start][openclaw STDERR]", errRing);
+
     const child = claw;
     claw = null;
     clawReady = false;
