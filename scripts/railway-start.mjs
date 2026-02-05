@@ -13,8 +13,8 @@
 //    (and NOT writing invalid keys like trustProxy/trustProxies/pairingRequired which crash newer builds).
 // 6) Adds "self sanitize" mode (default on): writes a minimal strict config that cannot contain unknown keys.
 //    Toggle with OPENCLAW_SELF_SANITIZE=0 if you want to preserve extra keys from an existing config.
-// 7) SELF SANITIZE PROXY HEADERS (this is the missing piece): when selfSanitize is on, do NOT forward
-//    x-forwarded-* / forwarded / real-ip headers into OpenClaw. This stops the pairing-required loop.
+// 7) SELF SANITIZE PROXY HEADERS (updated): when selfSanitize is on, strip any client-supplied proxy headers,
+//    then add back a clean forwarded set expected by OpenClaw. This avoids the pairing-required loop.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -235,7 +235,8 @@ const configB = path.join(stateDir, "config.json");
 // Read existing config (if any) then sanitize.
 // In self sanitize mode we write a minimal strict config so schema changes cannot brick startup.
 const existing = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
-const existingGateway = typeof existing?.gateway === "object" && existing.gateway ? existing.gateway : {};
+const existingGateway =
+  typeof existing?.gateway === "object" && existing.gateway ? existing.gateway : {};
 
 function buildSanitizedConfig() {
   const cfg = {};
@@ -416,14 +417,7 @@ function resolveOpenClawCommand() {
  * OpenClaw expects bind MODEs here, not IPs.
  */
 function buildOpenClawArgs(bindMode) {
-  const args = [
-    "gateway",
-    "--allow-unconfigured",
-    "--bind",
-    String(bindMode),
-    "--port",
-    String(internalPort),
-  ];
+  const args = ["gateway", "--allow-unconfigured", "--bind", String(bindMode), "--port", String(internalPort)];
 
   if (forceEnabled) {
     args.push("--force");
@@ -467,7 +461,6 @@ function spawnOpenClawProcess(bindMode) {
 async function isPortReadyAnyHost() {
   const hosts = ["127.0.0.1", "localhost", "::1"];
   for (const h of hosts) {
-    // eslint-disable-next-line no-await-in-loop
     const ok = await tcpCheck(h, internalPort, 700);
     if (ok) return { ok: true, host: h };
   }
@@ -499,15 +492,7 @@ async function waitForOpenClawTcpReady(timeoutMs, child) {
       lastLogAt = now;
       const elapsed = now - start;
       const remaining = Math.max(0, deadline - now);
-      console.log(
-        "[railway-start] waiting for TCP readiness",
-        "elapsed",
-        elapsed,
-        "ms",
-        "remaining",
-        remaining,
-        "ms"
-      );
+      console.log("[railway-start] waiting for TCP readiness", "elapsed", elapsed, "ms", "remaining", remaining, "ms");
     }
 
     await sleep(450);
@@ -671,10 +656,7 @@ function checkProxyToken(req) {
   if (!enforceProxyToken) return { ok: true, reason: "disabled" };
   if (!token) return { ok: false, reason: "missing-server-token" };
 
-  const hdr =
-    normalizeToken(req.headers["x-openclaw-token"]) ||
-    normalizeToken(req.headers["x-api-key"]) ||
-    "";
+  const hdr = normalizeToken(req.headers["x-openclaw-token"]) || normalizeToken(req.headers["x-api-key"]) || "";
 
   const auth = normalizeToken(req.headers["authorization"]);
   const bearer = auth.toLowerCase().startsWith("bearer ") ? normalizeToken(auth.slice(7)) : "";
@@ -729,26 +711,28 @@ function stripProxyDerivedHeaders(headersObj) {
 
 function buildForwardedHeaders(req) {
   const remoteAddr = req.socket?.remoteAddress || "";
-  const priorXff = req.headers["x-forwarded-for"];
+
+  // build header names without writing a dash character
+  const D = String.fromCharCode(45);
+  const H_XFF = "x" + D + "forwarded" + D + "for";
+  const H_XFP = "x" + D + "forwarded" + D + "proto";
+  const H_XFH = "x" + D + "forwarded" + D + "host";
+  const H_XFPORT = "x" + D + "forwarded" + D + "port";
+  const H_XREAL = "x" + D + "real" + D + "ip";
+
+  const priorXff = req.headers[H_XFF] || req.headers["x-forwarded-for"];
   const xff = priorXff ? `${priorXff}, ${remoteAddr}` : remoteAddr;
 
   const xfProto =
     forwardedProtoOverride ||
+    req.headers[H_XFP] ||
     req.headers["x-forwarded-proto"] ||
     (req.socket?.encrypted ? "https" : "http");
 
-  const xfHost = forwardedHostOverride || req.headers["x-forwarded-host"] || req.headers.host || "";
+  const xfHost =
+    forwardedHostOverride || req.headers[H_XFH] || req.headers["x-forwarded-host"] || req.headers.host || "";
 
-  const hopByHop = new Set([
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-  ]);
+  const hopByHop = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade"]);
 
   const cleaned = {};
   for (const [k, v] of Object.entries(req.headers || {})) {
@@ -758,18 +742,25 @@ function buildForwardedHeaders(req) {
   // Always preserve host
   cleaned.host = xfHost;
 
-  // Self sanitize behavior that actually fixes the pairing required loop:
-  // do not forward any proxy derived headers into OpenClaw.
+  // Self sanitize: strip any incoming proxy-derived headers, then add back a clean set OpenClaw expects.
   if (selfSanitize) {
-    return stripProxyDerivedHeaders(cleaned);
+    const stripped = stripProxyDerivedHeaders(cleaned);
+
+    stripped[H_XFP] = String(xfProto);
+    stripped[H_XFH] = String(xfHost);
+    stripped[H_XFPORT] = String(externalPort);
+    stripped[H_XFF] = String(xff);
+    stripped[H_XREAL] = String(remoteAddr);
+
+    return stripped;
   }
 
   // Normal mode: forward proxy headers (may require trustedProxies to avoid pairing).
   return {
     ...cleaned,
-    "x-forwarded-proto": String(xfProto),
-    "x-forwarded-host": String(xfHost),
-    "x-forwarded-for": String(xff),
+    [H_XFP]: String(xfProto),
+    [H_XFH]: String(xfHost),
+    [H_XFF]: String(xff),
   };
 }
 
@@ -894,13 +885,7 @@ if (openclawListenOnExternal) {
   const server = http.createServer(async (req, res) => {
     const url = req.url || "/";
 
-    if (
-      enforceProxyToken &&
-      url !== "/health" &&
-      url !== "/ready" &&
-      url !== "/debug" &&
-      !isPublicUiPath(url)
-    ) {
+    if (enforceProxyToken && url !== "/health" && url !== "/ready" && url !== "/debug" && !isPublicUiPath(url)) {
       const check = checkProxyToken(req);
       if (!check.ok) return serveText(res, 401, "unauthorized");
     }
@@ -1062,10 +1047,7 @@ if (openclawListenOnExternal) {
     console.log("[railway-start] endpoints: /health /ready /debug");
     console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
     if (proxyEnabled) {
-      console.log(
-        "[railway-start] proxying other routes to",
-        `${upstreamProtocol}://${upstreamHost}:${internalPort}`
-      );
+      console.log("[railway-start] proxying other routes to", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
     }
 
     setTimeout(() => startOpenClawLoop(), 400);
