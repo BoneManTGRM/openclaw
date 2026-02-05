@@ -275,10 +275,19 @@ async function startOpenClawLoop() {
     console.error("[railway-start] Failed to spawn OpenClaw:", e?.message || e);
     claw = null;
     clawStarting = false;
+    
+    // CRITICAL FIX: Wait before retrying spawn failures to prevent resource exhaustion
     restartAttempt += 1;
     const waitMs = computeBackoffMs(restartAttempt);
-    console.log("[railway-start] retrying start in", waitMs, "ms");
-    setTimeout(() => startOpenClawLoop(), waitMs);
+    console.log("[railway-start] spawn failed, retrying in", waitMs, "ms");
+    
+    // Wait THEN retry
+    await sleep(waitMs);
+    
+    // Check if we've been superseded
+    if (myLoopId === startLoopId) {
+      startOpenClawLoop();
+    }
     return;
   }
 
@@ -307,6 +316,13 @@ async function startOpenClawLoop() {
 
   claw.on("exit", (code, signal) => {
     console.log("[railway-start] OpenClaw exited code:", code, "signal:", signal);
+    
+    // Only restart if this is still the active attempt
+    if (myLoopId !== startLoopId) {
+      console.log("[railway-start] Superseded by newer start attempt, not restarting");
+      return;
+    }
+    
     claw = null;
     clawStarting = false;
     clawReady = false;
@@ -318,6 +334,19 @@ async function startOpenClawLoop() {
 
   claw.on("error", (err) => {
     console.error("[railway-start] OpenClaw process error:", err?.message || err);
+    
+    // Only restart if this is still the active attempt AND we haven't already scheduled restart
+    if (myLoopId !== startLoopId) {
+      console.log("[railway-start] Superseded, not restarting");
+      return;
+    }
+    
+    // Don't double-restart - exit handler will handle it
+    if (!claw) {
+      console.log("[railway-start] Already cleaned up, not restarting");
+      return;
+    }
+    
     claw = null;
     clawStarting = false;
     clawReady = false;
