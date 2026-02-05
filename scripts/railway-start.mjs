@@ -16,6 +16,17 @@
 // 7) SELF SANITIZE PROXY HEADERS (updated again): when selfSanitize is on, strip all client-supplied
 //    proxy-derived headers AND do not add x-forwarded-* back. This prevents OpenClaw from seeing any
 //    proxy headers at all, which stops the "Proxy headers detected from untrusted address" loop on Railway.
+// 8) HOST HEADER FIX (new): on Railway the proxy connects to OpenClaw via loopback, but the inbound Host header
+//    is your public Railway domain. OpenClaw logs:
+//      "Loopback connection with non-local Host header. Treating it as remote."
+//    That flips the session into "remote" and triggers "pairing required".
+//    Fix: when proxying to loopback, send a local Host header to OpenClaw, while preserving the public host
+//    in x-forwarded-host (when not selfSanitize). In selfSanitize mode we keep Host local and do not add
+//    forwarded headers back.
+// 9) OPTIONAL AUTH FILE WRITER (new): if you provide OPENCLAW_AUTH_PROFILES_JSON or OPENCLAW_AUTH_PROFILES_B64,
+//    this script will write it to the agent auth store path OpenClaw logs mention:
+//      /home/node/.openclaw/agents/main/agent/auth-profiles.json
+//    This avoids guessing provider schema in this launcher.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -71,6 +82,17 @@ function safeMkdir(dir) {
 function safeWriteJson(p, obj) {
   try {
     fs.writeFileSync(p, JSON.stringify(obj, null, 2), "utf8");
+    console.log(`[railway-start] wrote ${p}`);
+    return true;
+  } catch (e) {
+    console.log(`[railway-start] write failed ${p}: ${e?.message || e}`);
+    return false;
+  }
+}
+
+function safeWriteText(p, text) {
+  try {
+    fs.writeFileSync(p, String(text ?? ""), "utf8");
     console.log(`[railway-start] wrote ${p}`);
     return true;
   } catch (e) {
@@ -141,6 +163,30 @@ function hasWorkingLsof() {
   }
 }
 
+function isLoopbackHost(h) {
+  const s = String(h || "").trim().toLowerCase();
+  if (!s) return false;
+  if (s === "127.0.0.1") return true;
+  if (s === "localhost") return true;
+  if (s === "::1") return true;
+  return false;
+}
+
+function isLocalHostHeader(hostHeader) {
+  const raw = String(hostHeader || "").trim().toLowerCase();
+  if (!raw) return false;
+  const hostOnly = raw.split(":")[0];
+  return hostOnly === "127.0.0.1" || hostOnly === "localhost" || hostOnly === "[::1]" || hostOnly === "::1";
+}
+
+function buildLocalHostHeader(hostForUpstream, portForUpstream) {
+  const hh = String(hostForUpstream || "").trim();
+  if (!hh) return `127.0.0.1:${portForUpstream}`;
+  // If already has port, keep it
+  if (hh.includes(":") && !hh.startsWith("[::1]")) return hh;
+  return `${hh}:${portForUpstream}`;
+}
+
 // Railway port (public)
 const externalPort = envInt("PORT", 8080);
 
@@ -173,6 +219,9 @@ const upstreamHost = envStr("OPENCLAW_UPSTREAM_HOST", "127.0.0.1");
 // Optional: override forwarded host/proto if you want hardcoding.
 const forwardedProtoOverride = envStr("OPENCLAW_FORWARDED_PROTO", "");
 const forwardedHostOverride = envStr("OPENCLAW_FORWARDED_HOST", "");
+
+// Optional: if set, force the Host header sent upstream (rare)
+const upstreamHostHeaderOverride = envStr("OPENCLAW_UPSTREAM_HOST_HEADER", "");
 
 /**
  * OpenClaw `gateway --bind` expects a MODE, not an IP.
@@ -332,6 +381,31 @@ if (selfSanitize) {
 
 safeWriteJson(configA, configToWrite);
 safeWriteJson(configB, configToWrite);
+
+// Optional: write OpenClaw agent auth store if provided
+// This is intentionally dumb: we do not guess schema, we only write what you provide.
+(function writeAuthProfilesIfProvided() {
+  const jsonRaw = envStr("OPENCLAW_AUTH_PROFILES_JSON", "").trim();
+  const b64 = envStr("OPENCLAW_AUTH_PROFILES_B64", "").trim();
+  if (!jsonRaw && !b64) return;
+
+  const agentAuthDir = path.join(stateDir, "agents", "main", "agent");
+  const authPath = path.join(agentAuthDir, "auth-profiles.json");
+
+  safeMkdir(agentAuthDir);
+
+  if (jsonRaw) {
+    safeWriteText(authPath, jsonRaw);
+    return;
+  }
+
+  try {
+    const buf = Buffer.from(b64, "base64");
+    safeWriteText(authPath, buf.toString("utf8"));
+  } catch (e) {
+    console.log(`[railway-start] failed to decode OPENCLAW_AUTH_PROFILES_B64: ${e?.message || e}`);
+  }
+})();
 
 let claw = null;
 let clawStarting = false;
@@ -729,6 +803,22 @@ function stripProxyDerivedHeaders(headersObj) {
   return out;
 }
 
+function pickHostHeaderForUpstream(req, xfHost) {
+  if (upstreamHostHeaderOverride) return upstreamHostHeaderOverride;
+
+  const inboundHost = req.headers?.host || "";
+  const inboundIsLocal = isLocalHostHeader(inboundHost);
+
+  // If proxying to loopback and inbound Host is not local, rewrite Host to local for OpenClaw.
+  // This prevents: "Loopback connection with non-local Host header. Treating it as remote."
+  if (isLoopbackHost(upstreamHost) && !inboundIsLocal) {
+    return buildLocalHostHeader(upstreamHost, internalPort);
+  }
+
+  // Otherwise keep original (or forwarded) host.
+  return xfHost || inboundHost || "";
+}
+
 function buildForwardedHeaders(req) {
   const remoteAddr = req.socket?.remoteAddress || "";
 
@@ -772,16 +862,16 @@ function buildForwardedHeaders(req) {
     if (!hopByHop.has(String(k).toLowerCase())) cleaned[k] = v;
   }
 
-  // Always preserve host
-  cleaned.host = xfHost;
+  // Always preserve host, but possibly rewrite it to local for OpenClaw when upstream is loopback
+  cleaned.host = pickHostHeaderForUpstream(req, xfHost);
 
   // Self sanitize: strip any incoming proxy-derived headers and do NOT add any forwarded headers back.
   // This is the key change that stops OpenClaw from detecting proxy headers as "untrusted" on Railway.
   if (selfSanitize) {
     const stripped = stripProxyDerivedHeaders(cleaned);
 
-    // Keep a stable host header only
-    stripped.host = xfHost || stripped.host || "";
+    // Keep Host stable and local when needed
+    stripped.host = cleaned.host || stripped.host || "";
 
     // Do not set:
     // stripped[H_XFP], stripped[H_XFH], stripped[H_XFPORT], stripped[H_XFF], stripped[H_XREAL]
@@ -791,6 +881,7 @@ function buildForwardedHeaders(req) {
   }
 
   // Normal mode: forward proxy headers (may require trustedProxies to avoid pairing).
+  // Keep Host local when upstream is loopback, but preserve public host in x-forwarded-host.
   return {
     ...cleaned,
     [H_XFP]: String(xfProto),
@@ -949,6 +1040,7 @@ if (openclawListenOnExternal) {
         openclawListenOnExternal,
         upstreamProtocol,
         upstreamHost,
+        upstreamHostHeaderOverride,
         clawReady,
         clawRunning: !!claw,
         clawPid: claw?.pid || null,
