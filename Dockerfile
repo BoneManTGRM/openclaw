@@ -1,15 +1,16 @@
 # Dockerfile
-# Updates vs your current version
-# - Installs curl and ca-certificates (bun installer and many package installs need them)
-# - Runs bun install as the node user so ownership is correct and bun is usable at runtime
-# - Keeps pnpm via corepack, and preserves good layer caching
-# - Leaves your CMD the same
+# Railway-friendly OpenClaw build
+# - Installs curl + ca-certificates (bun installer + many registries need these)
+# - Installs pnpm via corepack and pins PNPM_VERSION
+# - Installs bun as the node user so it works at runtime (owned by /home/node)
+# - Preserves good layer caching (copy manifests first, install deps, then copy rest)
+# - Keeps your CMD the same
 
 FROM node:22-bookworm
 
 WORKDIR /app
 
-# System packages
+# Optional system packages (and required curl/ca-certs)
 ARG OPENCLAW_DOCKER_APT_PACKAGES=""
 RUN set -eux; \
     apt-get update; \
@@ -32,7 +33,9 @@ RUN set -eux; \
     chown -R node:node /home/node
 
 USER node
-RUN curl -fsSL https://bun.sh/install | bash
+RUN set -eux; \
+    curl -fsSL https://bun.sh/install | bash; \
+    bun --version
 USER root
 
 # Copy only dependency manifests first (better Docker cache)
@@ -41,7 +44,7 @@ COPY ui/package.json ./ui/package.json
 COPY patches ./patches
 COPY scripts ./scripts
 
-# Install deps
+# Install deps (as root is fine; we fix ownership later)
 RUN pnpm install --frozen-lockfile
 
 # Copy the rest of the repo
