@@ -91,7 +91,9 @@ function tcpCheck(host, port, timeoutMs = 800) {
   return new Promise((resolve) => {
     const sock = net.connect({ host, port });
     const done = (ok) => {
-      try { sock.destroy(); } catch {}
+      try {
+        sock.destroy();
+      } catch {}
       resolve(ok);
     };
     sock.setTimeout(timeoutMs);
@@ -125,7 +127,9 @@ const internalPort = envInt("OPENCLAW_INTERNAL_PORT", 8081);
 const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
-const startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 20000);
+// Railway cold starts can be slow
+const startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 45000);
+
 const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
 const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
 
@@ -136,11 +140,17 @@ const candidates = [
   "/tmp/.openclaw",
 ].filter(Boolean);
 
-let stateDir = candidates[0] || "/home/node/.openclaw";
-for (const dir of candidates) {
-  if (canWriteDir(dir)) {
-    stateDir = dir;
-    break;
+// Prefer /tmp on Railway unless user explicitly sets OPENCLAW_STATE_DIR
+let stateDir = "/tmp/.openclaw";
+
+if (process.env.OPENCLAW_STATE_DIR && canWriteDir(process.env.OPENCLAW_STATE_DIR)) {
+  stateDir = process.env.OPENCLAW_STATE_DIR;
+} else {
+  for (const dir of candidates) {
+    if (canWriteDir(dir)) {
+      stateDir = dir;
+      break;
+    }
   }
 }
 
@@ -158,8 +168,8 @@ const configB = path.join(stateDir, "config.json");
 const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 base.gateway = base.gateway || {};
 
-// CRITICAL FIX: Remove the 'bind' field - it's CLI-only, not allowed in config!
-// base.gateway.bind = "127.0.0.1";  // ❌ THIS WAS THE BUG
+// CRITICAL: Do not write "bind" into config. Use CLI args for bind.
+// base.gateway.bind = "127.0.0.1";
 
 base.gateway.port = Number(internalPort);
 base.gateway.trustedProxies = uniq([
@@ -186,6 +196,7 @@ let clawReady = false;
 
 let restartAttempt = 0;
 let startLoopId = 0;
+let restartScheduled = false;
 
 function computeBackoffMs(attempt) {
   const a = clamp(attempt, 0, 8);
@@ -206,6 +217,16 @@ function killChild(child) {
   }, 2500);
 }
 
+function scheduleRestart(waitMs) {
+  if (restartScheduled) return;
+  restartScheduled = true;
+  console.log("[railway-start] restarting in", waitMs, "ms");
+  setTimeout(() => {
+    restartScheduled = false;
+    startOpenClawLoop();
+  }, waitMs);
+}
+
 function spawnOpenClawProcess() {
   const childEnv = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
 
@@ -220,7 +241,8 @@ function spawnOpenClawProcess() {
       String(internalPort),
     ];
     console.log("[railway-start] exec:", ["openclaw", ...args].join(" "));
-    return spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
+    // Inherit logs so you see full crash output in Railway
+    return spawn("openclaw", args, { stdio: "inherit", env: childEnv });
   }
 
   // Fallback: run the node entrypoint directly if openclaw binary is missing
@@ -239,7 +261,7 @@ function spawnOpenClawProcess() {
     String(internalPort),
   ];
   console.log("[railway-start] exec:", ["node", ...args].join(" "));
-  return spawn("node", args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
+  return spawn("node", args, { stdio: "inherit", env: childEnv });
 }
 
 async function waitForOpenClawTcpReady(timeoutMs) {
@@ -275,89 +297,61 @@ async function startOpenClawLoop() {
     console.error("[railway-start] Failed to spawn OpenClaw:", e?.message || e);
     claw = null;
     clawStarting = false;
-    
-    // CRITICAL FIX: Wait before retrying spawn failures to prevent resource exhaustion
+
     restartAttempt += 1;
     const waitMs = computeBackoffMs(restartAttempt);
     console.log("[railway-start] spawn failed, retrying in", waitMs, "ms");
-    
-    // Wait THEN retry
+
     await sleep(waitMs);
-    
-    // Check if we've been superseded
+
     if (myLoopId === startLoopId) {
       startOpenClawLoop();
     }
     return;
   }
 
-  const markReadyFromLine = (s) => {
-    const t = String(s || "").toLowerCase();
-    if (t.includes("listening") || t.includes("started") || t.includes("ready")) {
-      clawReady = true;
-    }
-  };
-
-  claw.stdout.on("data", (data) => {
-    const lines = data.toString().split("\n").filter(Boolean);
-    for (const ln of lines) {
-      console.log("[openclaw]", ln);
-      markReadyFromLine(ln);
-    }
-  });
-
-  claw.stderr.on("data", (data) => {
-    const lines = data.toString().split("\n").filter(Boolean);
-    for (const ln of lines) {
-      console.error("[openclaw ERROR]", ln);
-      markReadyFromLine(ln);
-    }
-  });
-
   claw.on("exit", (code, signal) => {
     console.log("[railway-start] OpenClaw exited code:", code, "signal:", signal);
-    
-    // Only restart if this is still the active attempt
+
     if (myLoopId !== startLoopId) {
       console.log("[railway-start] Superseded by newer start attempt, not restarting");
       return;
     }
-    
+
     claw = null;
     clawStarting = false;
     clawReady = false;
+
     restartAttempt += 1;
     const waitMs = computeBackoffMs(restartAttempt);
-    console.log("[railway-start] restarting in", waitMs, "ms");
-    setTimeout(() => startOpenClawLoop(), waitMs);
+    scheduleRestart(waitMs);
   });
 
   claw.on("error", (err) => {
     console.error("[railway-start] OpenClaw process error:", err?.message || err);
-    
-    // Only restart if this is still the active attempt AND we haven't already scheduled restart
+
     if (myLoopId !== startLoopId) {
       console.log("[railway-start] Superseded, not restarting");
       return;
     }
-    
-    // Don't double-restart - exit handler will handle it
-    if (!claw) {
-      console.log("[railway-start] Already cleaned up, not restarting");
-      return;
-    }
-    
+
+    // If exit also fires, scheduleRestart will guard against double restart
+    const child = claw;
     claw = null;
     clawStarting = false;
     clawReady = false;
+    try {
+      if (child) killChild(child);
+    } catch {}
+
     restartAttempt += 1;
     const waitMs = computeBackoffMs(restartAttempt);
-    console.log("[railway-start] restarting in", waitMs, "ms");
-    setTimeout(() => startOpenClawLoop(), waitMs);
+    scheduleRestart(waitMs);
   });
 
   // Gate: if TCP never becomes ready, restart the child
   const becameReady = await waitForOpenClawTcpReady(startupTimeoutMs);
+
   if (myLoopId !== startLoopId) {
     clawStarting = false;
     return;
@@ -370,10 +364,10 @@ async function startOpenClawLoop() {
     clawReady = false;
     clawStarting = false;
     killChild(child);
+
     restartAttempt += 1;
     const waitMs = computeBackoffMs(restartAttempt);
-    console.log("[railway-start] restarting in", waitMs, "ms");
-    setTimeout(() => startOpenClawLoop(), waitMs);
+    scheduleRestart(waitMs);
     return;
   }
 
@@ -447,6 +441,9 @@ const server = http.createServer(async (req, res) => {
       startupTimeoutMs,
       watchdogIntervalMs,
       proxyTimeoutMs,
+      restartAttempt,
+      restartScheduled,
+      clawStarting,
     });
     return;
   }
@@ -483,7 +480,9 @@ const server = http.createServer(async (req, res) => {
   );
 
   proxyReq.on("timeout", () => {
-    try { proxyReq.destroy(new Error("upstream timeout")); } catch {}
+    try {
+      proxyReq.destroy(new Error("upstream timeout"));
+    } catch {}
   });
 
   proxyReq.on("error", (err) => {
@@ -501,7 +500,9 @@ server.on("upgrade", async (req, socket, head) => {
   try {
     const isReady = await isOpenClawReadyFast();
     if (!isReady) {
-      try { socket.destroy(); } catch {}
+      try {
+        socket.destroy();
+      } catch {}
       return;
     }
 
@@ -528,14 +529,20 @@ server.on("upgrade", async (req, socket, head) => {
 
     upstream.on("error", (err) => {
       console.log("[railway-start] WebSocket upgrade error:", err?.message || err);
-      try { socket.destroy(); } catch {}
+      try {
+        socket.destroy();
+      } catch {}
     });
 
     socket.on("error", () => {
-      try { upstream.destroy(); } catch {}
+      try {
+        upstream.destroy();
+      } catch {}
     });
   } catch (e) {
-    try { socket.destroy(); } catch {}
+    try {
+      socket.destroy();
+    } catch {}
   }
 });
 
@@ -558,13 +565,18 @@ server.listen(externalPort, "0.0.0.0", () => {
     claw = null;
     clawReady = false;
     killChild(child);
-    setTimeout(() => startOpenClawLoop(), computeBackoffMs(1));
+
+    // reset restart attempt a bit so watchdog recoveries are not too slow
+    restartAttempt = Math.max(1, restartAttempt);
+    scheduleRestart(computeBackoffMs(1));
   }, watchdogIntervalMs).unref();
 });
 
 function shutdown(reason) {
   console.log("[railway-start] shutdown:", reason);
-  try { server.close(); } catch {}
+  try {
+    server.close();
+  } catch {}
   const child = claw;
   claw = null;
   if (child) killChild(child);
