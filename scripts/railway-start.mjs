@@ -11,6 +11,8 @@
 // 5) Fixes pairing-required websocket closes caused by "untrusted proxy headers" by writing ONLY the
 //    currently valid OpenClaw config key: gateway.trustedProxies
 //    (and NOT writing invalid keys like trustProxy/trustProxies/pairingRequired which crash newer builds).
+// 6) Adds "self sanitize" mode (default on): writes a minimal strict config that cannot contain unknown keys.
+//    Toggle with OPENCLAW_SELF_SANITIZE=0 if you want to preserve extra keys from an existing config.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -98,9 +100,7 @@ function parseTrustedProxies() {
     "127.0.0.1/32",
     "::1/128",
   ];
-  const extra = override
-    ? override.split(",").map((s) => s.trim()).filter(Boolean)
-    : [];
+  const extra = override ? override.split(",").map((s) => s.trim()).filter(Boolean) : [];
   return uniq([...base, ...extra]);
 }
 
@@ -152,6 +152,9 @@ const internalPort = openclawListenOnExternal ? externalPort : internalPortDefau
 
 const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
+
+// Self sanitize config to a strict minimal object that cannot contain unknown keys.
+const selfSanitize = envBool("OPENCLAW_SELF_SANITIZE", true);
 
 let startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 120000);
 startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
@@ -214,6 +217,7 @@ console.log("[railway-start] chosen stateDir =", stateDir);
 console.log("[railway-start] token present =", token ? "yes" : "no");
 console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
 console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" : "no");
+console.log("[railway-start] selfSanitize =", selfSanitize ? "yes" : "no");
 console.log("[railway-start] startupTimeoutMs =", startupTimeoutMs);
 console.log("[railway-start] bindPrimary =", bindPrimary, "bindFallback =", bindFallback);
 console.log("[railway-start] OPENCLAW_SHELL_LOCAL_BIN =", useShellForLocalBin ? "yes" : "no");
@@ -226,44 +230,104 @@ safeMkdir(stateDir);
 const configA = path.join(stateDir, "openclaw.json");
 const configB = path.join(stateDir, "config.json");
 
-// Read existing config (if any) and normalize to only supported keys.
-// Newer OpenClaw builds reject keys like trustProxy/trustProxies/pairingRequired at root or gateway.
-const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
-base.gateway = base.gateway || {};
+// Read existing config (if any) then sanitize.
+// In self sanitize mode we write a minimal strict config so schema changes cannot brick startup.
+const existing = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
+const existingGateway = typeof existing?.gateway === "object" && existing.gateway ? existing.gateway : {};
 
-// Ensure port is correct for whichever mode we are in
-base.gateway.port = Number(internalPort);
+function buildSanitizedConfig() {
+  const cfg = {};
+  cfg.gateway = {};
 
-// Trusted proxies
-// IMPORTANT: only write the currently valid key: gateway.trustedProxies
-const trusted = uniq([
-  ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
-  ...parseTrustedProxies(),
-]);
-base.gateway.trustedProxies = trusted;
+  // Ensure port is correct for whichever mode we are in
+  cfg.gateway.port = Number(internalPort);
 
-// Strip known-invalid keys (prevents boot crash on strict schema builds)
-delete base.trustProxy;
-delete base.trustedProxies;
-if (base.gateway) {
-  delete base.gateway.trustProxy;
-  delete base.gateway.trustProxies;
-  delete base.gateway.pairingRequired;
+  // Trusted proxies
+  // IMPORTANT: only write the currently valid key: gateway.trustedProxies
+  const trusted = uniq([
+    ...(Array.isArray(existingGateway.trustedProxies) ? existingGateway.trustedProxies : []),
+    ...parseTrustedProxies(),
+  ]);
+  cfg.gateway.trustedProxies = trusted;
+
+  // Gateway auth (token) optional
+  if (enforceTokenAuth && token) {
+    cfg.gateway.auth = { mode: "token", token };
+    console.log("[railway-start] gateway auth enabled (token)");
+  } else {
+    console.log("[railway-start] gateway auth disabled");
+  }
+
+  return { cfg, trusted };
 }
 
-// Gateway auth (token) optional
-if (enforceTokenAuth && token) {
-  base.gateway.auth = base.gateway.auth || {};
-  base.gateway.auth.mode = "token";
-  base.gateway.auth.token = token;
-  console.log("[railway-start] gateway auth enabled (token)");
+function buildCompatConfig() {
+  // Preserve existing object, but strip known invalid keys.
+  const base = typeof existing === "object" && existing ? existing : {};
+  base.gateway = typeof base.gateway === "object" && base.gateway ? base.gateway : {};
+
+  // Ensure port is correct for whichever mode we are in
+  base.gateway.port = Number(internalPort);
+
+  // Trusted proxies
+  const trusted = uniq([
+    ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
+    ...parseTrustedProxies(),
+  ]);
+  base.gateway.trustedProxies = trusted;
+
+  // Strip known-invalid keys (prevents boot crash on strict schema builds)
+  delete base.trustProxy;
+  delete base.trustedProxies;
+  if (base.gateway) {
+    delete base.gateway.trustProxy;
+    delete base.gateway.trustProxies;
+    delete base.gateway.pairingRequired;
+  }
+
+  // Gateway auth (token) optional
+  if (enforceTokenAuth && token) {
+    base.gateway.auth = base.gateway.auth || {};
+    base.gateway.auth.mode = "token";
+    base.gateway.auth.token = token;
+    console.log("[railway-start] gateway auth enabled (token)");
+  } else {
+    if (base.gateway.auth) delete base.gateway.auth;
+    console.log("[railway-start] gateway auth disabled");
+  }
+
+  return { cfg: base, trusted };
+}
+
+let trusted = [];
+let configToWrite = null;
+
+if (selfSanitize) {
+  const built = buildSanitizedConfig();
+  configToWrite = built.cfg;
+  trusted = built.trusted;
+
+  // Helpful log: show what we dropped if an existing config had extra keys.
+  const existingRootKeys = Object.keys(typeof existing === "object" && existing ? existing : {});
+  const keptRootKeys = ["gateway"];
+  const droppedRoot = existingRootKeys.filter((k) => !keptRootKeys.includes(k));
+  if (droppedRoot.length) {
+    console.log("[railway-start] selfSanitize: dropped root keys:", droppedRoot.join(", "));
+  }
+  const existingGwKeys = Object.keys(existingGateway);
+  const keptGwKeys = ["port", "trustedProxies", "auth"];
+  const droppedGw = existingGwKeys.filter((k) => !keptGwKeys.includes(k));
+  if (droppedGw.length) {
+    console.log("[railway-start] selfSanitize: dropped gateway keys:", droppedGw.join(", "));
+  }
 } else {
-  if (base.gateway.auth) delete base.gateway.auth;
-  console.log("[railway-start] gateway auth disabled");
+  const built = buildCompatConfig();
+  configToWrite = built.cfg;
+  trusted = built.trusted;
 }
 
-safeWriteJson(configA, base);
-safeWriteJson(configB, base);
+safeWriteJson(configA, configToWrite);
+safeWriteJson(configB, configToWrite);
 
 let claw = null;
 let clawStarting = false;
@@ -825,6 +889,7 @@ if (openclawListenOnExternal) {
         stateDir,
         enforceTokenAuth,
         enforceProxyToken,
+        selfSanitize,
         startupTimeoutMs,
         watchdogIntervalMs,
         proxyTimeoutMs,
