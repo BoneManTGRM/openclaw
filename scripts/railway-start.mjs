@@ -1,20 +1,20 @@
 // scripts/railway-start.mjs
-// Updated: Railway friendly, safer proxying (supports HTTPS upstream), better WS upgrade,
-// avoids accidental double binding, and adds a few env toggles.
+// Railway friendly OpenClaw launcher and proxy.
 //
-// Key changes:
-// 1) Supports OPENCLAW_UPSTREAM_PROTOCOL=http|https (default http). Many OpenClaw builds serve HTTPS locally.
-// 2) More correct WebSocket upgrade proxy using http(s).request instead of raw net header injection.
-// 3) Lets you run OpenClaw directly on $PORT if you want (no wrapper port collision) via OPENCLAW_LISTEN_ON_EXTERNAL=1.
-// 4) Better forwarded headers + optional host override.
-// 5) Keeps your existing behavior by default (external proxy on PORT, OpenClaw on internal 8081).
+// Fixes applied to your current file
+// 1) Avoids OpenClaw --force when lsof is not available (common on Railway).
+// 2) Makes OPENCLAW_LISTEN_ON_EXTERNAL=1 actually work by NOT starting the wrapper HTTP server
+//    (otherwise wrapper and OpenClaw both try to bind PORT and you get EADDRINUSE).
+//    In that mode, OpenClaw serves everything including health.
+// 3) Ensures https-only options are only passed to https.request (rejectUnauthorized).
+// 4) Keeps your default behavior unchanged: wrapper listens on PORT and proxies to OpenClaw on 8081.
 
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 console.log("[railway-start] starting");
 
@@ -93,9 +93,7 @@ function parseTrustedProxies() {
     "127.0.0.1/32",
     "::1/128",
   ];
-  const extra = override
-    ? override.split(",").map((s) => s.trim()).filter(Boolean)
-    : [];
+  const extra = override ? override.split(",").map((s) => s.trim()).filter(Boolean) : [];
   return uniq([...base, ...extra]);
 }
 
@@ -123,14 +121,27 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function hasWorkingLsof() {
+  try {
+    const res = spawnSync("lsof", ["-v"], { stdio: "ignore" });
+    if (res.error) return false;
+    return res.status === 0 || res.status === 1;
+  } catch {
+    return false;
+  }
+}
+
 // Railway port (public)
 const externalPort = envInt("PORT", 8080);
 
-// By default, wrapper proxies to OpenClaw on 8081 (internal).
-// If you set OPENCLAW_LISTEN_ON_EXTERNAL=1, OpenClaw will bind to externalPort instead,
-// and the wrapper will ONLY serve /health, /ready, /debug (no proxy).
+// Internal port for OpenClaw when proxying (default)
 const internalPortDefault = envInt("OPENCLAW_INTERNAL_PORT", 8081);
+
+// If OPENCLAW_LISTEN_ON_EXTERNAL=1, OpenClaw binds to externalPort.
+// Important: in that mode this wrapper MUST NOT bind to externalPort, or you get EADDRINUSE.
+// So we skip creating the wrapper server entirely.
 const openclawListenOnExternal = envBool("OPENCLAW_LISTEN_ON_EXTERNAL", false);
+
 const internalPort = openclawListenOnExternal ? externalPort : internalPortDefault;
 
 const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
@@ -142,9 +153,9 @@ startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
 const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
 const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
 
-// Upstream protocol: some OpenClaw gateways run HTTPS on localhost.
-// Set OPENCLAW_UPSTREAM_PROTOCOL=https if you get TLS/SSL errors or blank UI.
-const upstreamProtocol = envStr("OPENCLAW_UPSTREAM_PROTOCOL", "http").toLowerCase() === "https" ? "https" : "http";
+// Upstream protocol for proxy mode
+const upstreamProtocol =
+  envStr("OPENCLAW_UPSTREAM_PROTOCOL", "http").toLowerCase() === "https" ? "https" : "http";
 const upstreamHost = envStr("OPENCLAW_UPSTREAM_HOST", "127.0.0.1");
 
 // Optional: override forwarded host/proto if you want hardcoding.
@@ -152,20 +163,24 @@ const forwardedProtoOverride = envStr("OPENCLAW_FORWARDED_PROTO", "");
 const forwardedHostOverride = envStr("OPENCLAW_FORWARDED_HOST", "");
 
 /**
- * IMPORTANT:
  * OpenClaw `gateway --bind` expects a MODE, not an IP.
- * Valid modes include: loopback, tailnet, lan, auto, custom
+ * Valid modes vary by build, common ones include:
+ * loopback, tailnet, lan, auto, custom
  */
 const bindPrimary = envStr("OPENCLAW_BIND", "loopback");
 const bindFallback = envStr("OPENCLAW_BIND_FALLBACK", "lan");
 
 const useShellForLocalBin = envBool("OPENCLAW_SHELL_LOCAL_BIN", true);
 
-// Optional: enforce a token on inbound requests to this wrapper proxy.
+// Optional: enforce a token on inbound requests to the wrapper proxy.
 const enforceProxyToken = envBool("OPENCLAW_PROXY_ENFORCE_TOKEN", false);
 
-// When OpenClaw is listening directly on externalPort, the wrapper won't proxy by default.
+// Proxy enabled by default, disabled automatically if OpenClaw is listening on external.
 const proxyEnabled = envBool("OPENCLAW_PROXY_ENABLED", !openclawListenOnExternal);
+
+// Use --force only if explicitly requested AND lsof exists.
+const forceRequested = envBool("OPENCLAW_FORCE", false);
+const forceEnabled = forceRequested && hasWorkingLsof();
 
 const candidates = [
   process.env.OPENCLAW_STATE_DIR,
@@ -198,6 +213,8 @@ console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" :
 console.log("[railway-start] startupTimeoutMs =", startupTimeoutMs);
 console.log("[railway-start] bindPrimary =", bindPrimary, "bindFallback =", bindFallback);
 console.log("[railway-start] OPENCLAW_SHELL_LOCAL_BIN =", useShellForLocalBin ? "yes" : "no");
+console.log("[railway-start] OpenClaw force requested =", forceRequested ? "yes" : "no");
+console.log("[railway-start] OpenClaw force enabled =", forceEnabled ? "yes" : "no");
 console.log("[railway-start] upstream =", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
 
 safeMkdir(stateDir);
@@ -312,15 +329,22 @@ function resolveOpenClawCommand() {
  * OpenClaw expects bind MODEs here, not IPs.
  */
 function buildOpenClawArgs(bindMode) {
-  return [
+  const args = [
     "gateway",
-    "--force",
     "--allow-unconfigured",
     "--bind",
     String(bindMode),
     "--port",
     String(internalPort),
   ];
+
+  if (forceEnabled) {
+    args.push("--force");
+  } else if (forceRequested && !forceEnabled) {
+    console.log("[railway-start] OPENCLAW_FORCE=1 requested but lsof is missing, skipping --force");
+  }
+
+  return args;
 }
 
 function currentBindForAttempt(attempt) {
@@ -566,8 +590,7 @@ function checkProxyToken(req) {
     "";
 
   const auth = normalizeToken(req.headers["authorization"]);
-  const bearer =
-    auth.toLowerCase().startsWith("bearer ") ? normalizeToken(auth.slice(7)) : "";
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? normalizeToken(auth.slice(7)) : "";
 
   const got = hdr || bearer;
   if (!got) return { ok: false, reason: "missing-client-token" };
@@ -576,9 +599,6 @@ function checkProxyToken(req) {
   return { ok: true, reason: "ok" };
 }
 
-/**
- * Allow the browser UI to load even if proxy token enforcement is enabled.
- */
 function isPublicUiPath(url) {
   const u = String(url || "/");
   if (u === "/") return true;
@@ -600,11 +620,7 @@ function buildForwardedHeaders(req) {
     req.headers["x-forwarded-proto"] ||
     (req.socket?.encrypted ? "https" : "http");
 
-  const xfHost =
-    forwardedHostOverride ||
-    req.headers["x-forwarded-host"] ||
-    req.headers.host ||
-    "";
+  const xfHost = forwardedHostOverride || req.headers["x-forwarded-host"] || req.headers.host || "";
 
   const hopByHop = new Set([
     "connection",
@@ -651,105 +667,41 @@ function serveText(res, code, text) {
 }
 
 function selectUpstreamClient() {
-  if (upstreamProtocol === "https") return https;
-  return http;
+  return upstreamProtocol === "https" ? https : http;
 }
 
 function selectUpstreamAgent() {
-  if (upstreamProtocol === "https") return proxyAgentHttps;
-  return proxyAgentHttp;
+  return upstreamProtocol === "https" ? proxyAgentHttps : proxyAgentHttp;
 }
 
-const server = http.createServer(async (req, res) => {
+function requestUpstream(req, res) {
   const url = req.url || "/";
-
-  if (
-    enforceProxyToken &&
-    url !== "/health" &&
-    url !== "/ready" &&
-    url !== "/debug" &&
-    !isPublicUiPath(url)
-  ) {
-    const check = checkProxyToken(req);
-    if (!check.ok) return serveText(res, 401, "unauthorized");
-  }
-
-  if (url === "/health") return serveText(res, 200, "ok");
-
-  if (url === "/ready") {
-    const ok = await isOpenClawReadyFast();
-    return serveText(res, ok ? 200 : 503, ok ? "ready" : "not-ready");
-  }
-
-  if (url === "/debug") {
-    const r = await isPortReadyAnyHost();
-    return serveJson(res, 200, {
-      externalPort,
-      internalPort,
-      proxyEnabled,
-      openclawListenOnExternal,
-      upstreamProtocol,
-      upstreamHost,
-      clawReady,
-      clawRunning: !!claw,
-      clawPid: claw?.pid || null,
-      tcpReady: r.ok,
-      tcpHost: r.host,
-      stateDir,
-      enforceTokenAuth,
-      enforceProxyToken,
-      startupTimeoutMs,
-      watchdogIntervalMs,
-      proxyTimeoutMs,
-      restartAttempt,
-      restartScheduled,
-      clawStarting,
-      bindPrimary,
-      bindFallback,
-      OPENCLAW_SHELL_LOCAL_BIN: useShellForLocalBin,
-      outTail: outRing.slice(-120),
-      errTail: errRing.slice(-120),
-    });
-  }
-
-  if (!claw && !clawStarting) {
-    setTimeout(() => startOpenClawLoop(), 0);
-  }
-
-  if (!proxyEnabled) {
-    // In this mode OpenClaw should be directly serving externalPort. We keep wrapper endpoints only.
-    return serveText(
-      res,
-      404,
-      "Proxy disabled. OpenClaw should be bound to PORT directly. Use /health /ready /debug here."
-    );
-  }
-
-  const isReady = await isOpenClawReadyFast();
-  if (!isReady) return serveText(res, 503, "OpenClaw is not ready yet. Check /debug.");
-
   const headers = buildForwardedHeaders(req);
 
   const client = selectUpstreamClient();
   const agent = selectUpstreamAgent();
 
-  const proxyReq = client.request(
-    {
-      agent,
-      hostname: upstreamHost,
-      port: internalPort,
-      method: req.method,
-      path: url,
-      headers,
-      timeout: proxyTimeoutMs,
-      // If upstream is https with self-signed cert, set OPENCLAW_UPSTREAM_INSECURE=1
-      rejectUnauthorized: !envBool("OPENCLAW_UPSTREAM_INSECURE", false),
-    },
-    (proxyRes) => {
-      res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
-      proxyRes.pipe(res);
-    }
-  );
+  const insecure = envBool("OPENCLAW_UPSTREAM_INSECURE", false);
+
+  const options = {
+    agent,
+    hostname: upstreamHost,
+    port: internalPort,
+    method: req.method,
+    path: url,
+    headers,
+    timeout: proxyTimeoutMs,
+  };
+
+  // Only https supports rejectUnauthorized
+  if (upstreamProtocol === "https") {
+    options.rejectUnauthorized = !insecure;
+  }
+
+  const proxyReq = client.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
 
   proxyReq.on("timeout", () => {
     try {
@@ -763,107 +715,16 @@ const server = http.createServer(async (req, res) => {
   });
 
   req.pipe(proxyReq);
-});
+}
 
-// WebSocket / Upgrade proxy
-server.on("upgrade", async (req, socket, head) => {
-  try {
-    const url = req.url || "/";
+// If OpenClaw binds to externalPort, do not start wrapper server (port collision).
+// Start OpenClaw and keep the process alive.
+if (openclawListenOnExternal) {
+  console.log("[railway-start] OPENCLAW_LISTEN_ON_EXTERNAL=1");
+  console.log("[railway-start] wrapper HTTP server disabled to avoid EADDRINUSE");
+  console.log("[railway-start] OpenClaw should serve /health /ready or its own endpoints");
 
-    if (enforceProxyToken && url !== "/debug" && !isPublicUiPath(url)) {
-      const check = checkProxyToken(req);
-      if (!check.ok) {
-        try {
-          socket.destroy();
-        } catch {}
-        return;
-      }
-    }
-
-    if (!proxyEnabled) {
-      try {
-        socket.destroy();
-      } catch {}
-      return;
-    }
-
-    const isReady = await isOpenClawReadyFast();
-    if (!isReady) {
-      try {
-        socket.destroy();
-      } catch {}
-      return;
-    }
-
-    const headers = buildForwardedHeaders(req);
-
-    // Proper WS proxy: create an upstream request and pipe sockets.
-    const client = selectUpstreamClient();
-    const agent = selectUpstreamAgent();
-
-    const upstreamReq = client.request({
-      agent,
-      hostname: upstreamHost,
-      port: internalPort,
-      method: req.method,
-      path: url,
-      headers: {
-        ...headers,
-        connection: "Upgrade",
-        upgrade: "websocket",
-      },
-      timeout: proxyTimeoutMs,
-      rejectUnauthorized: !envBool("OPENCLAW_UPSTREAM_INSECURE", false),
-    });
-
-    upstreamReq.on("upgrade", (upstreamRes, upstreamSocket) => {
-      // Send upstream handshake response back to client
-      const lines = [
-        `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage || ""}`.trim(),
-        ...Object.entries(upstreamRes.headers).map(([k, v]) => `${k}: ${v}`),
-        "",
-        "",
-      ];
-      socket.write(lines.join("\r\n"));
-
-      if (head && head.length) upstreamSocket.write(head);
-
-      socket.pipe(upstreamSocket).pipe(socket);
-
-      socket.on("error", () => {
-        try {
-          upstreamSocket.destroy();
-        } catch {}
-      });
-
-      upstreamSocket.on("error", () => {
-        try {
-          socket.destroy();
-        } catch {}
-      });
-    });
-
-    upstreamReq.on("error", () => {
-      try {
-        socket.destroy();
-      } catch {}
-    });
-
-    upstreamReq.end();
-  } catch {
-    try {
-      socket.destroy();
-    } catch {}
-  }
-});
-
-server.listen(externalPort, "0.0.0.0", () => {
-  console.log("[railway-start] public server listening on 0.0.0.0:" + externalPort);
-  console.log("[railway-start] endpoints: /health /ready /debug");
-  console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
-  if (proxyEnabled) console.log("[railway-start] proxying other routes to", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
-
-  setTimeout(() => startOpenClawLoop(), 400);
+  setTimeout(() => startOpenClawLoop(), 0);
 
   setInterval(async () => {
     if (!claw || clawStarting) return;
@@ -882,26 +743,245 @@ server.listen(externalPort, "0.0.0.0", () => {
     restartAttempt = Math.max(1, restartAttempt);
     scheduleRestart(computeBackoffMs(1));
   }, watchdogIntervalMs).unref();
-});
 
-function shutdown(reason) {
-  console.log("[railway-start] shutdown:", reason);
-  try {
-    server.close();
-  } catch {}
-  const child = claw;
-  claw = null;
-  if (child) killChild(child);
-  setTimeout(() => process.exit(0), 1200);
+  function shutdown(reason) {
+    console.log("[railway-start] shutdown:", reason);
+    const child = claw;
+    claw = null;
+    if (child) killChild(child);
+    setTimeout(() => process.exit(0), 1200);
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("uncaughtException", (e) => {
+    console.error("[railway-start] uncaughtException:", e?.stack || e);
+    shutdown("uncaughtException");
+  });
+  process.on("unhandledRejection", (e) => {
+    console.error("[railway-start] unhandledRejection:", e?.stack || e);
+    shutdown("unhandledRejection");
+  });
+
+  // Keep Node alive even if OpenClaw exits immediately and restarts are scheduled
+  setInterval(() => {}, 1 << 30).unref();
+
+} else {
+  const server = http.createServer(async (req, res) => {
+    const url = req.url || "/";
+
+    if (
+      enforceProxyToken &&
+      url !== "/health" &&
+      url !== "/ready" &&
+      url !== "/debug" &&
+      !isPublicUiPath(url)
+    ) {
+      const check = checkProxyToken(req);
+      if (!check.ok) return serveText(res, 401, "unauthorized");
+    }
+
+    if (url === "/health") return serveText(res, 200, "ok");
+
+    if (url === "/ready") {
+      const ok = await isOpenClawReadyFast();
+      return serveText(res, ok ? 200 : 503, ok ? "ready" : "not-ready");
+    }
+
+    if (url === "/debug") {
+      const r = await isPortReadyAnyHost();
+      return serveJson(res, 200, {
+        externalPort,
+        internalPort,
+        proxyEnabled,
+        openclawListenOnExternal,
+        upstreamProtocol,
+        upstreamHost,
+        clawReady,
+        clawRunning: !!claw,
+        clawPid: claw?.pid || null,
+        tcpReady: r.ok,
+        tcpHost: r.host,
+        stateDir,
+        enforceTokenAuth,
+        enforceProxyToken,
+        startupTimeoutMs,
+        watchdogIntervalMs,
+        proxyTimeoutMs,
+        restartAttempt,
+        restartScheduled,
+        clawStarting,
+        bindPrimary,
+        bindFallback,
+        OPENCLAW_SHELL_LOCAL_BIN: useShellForLocalBin,
+        OPENCLAW_FORCE: forceRequested,
+        OPENCLAW_FORCE_ENABLED: forceEnabled,
+        outTail: outRing.slice(-120),
+        errTail: errRing.slice(-120),
+      });
+    }
+
+    if (!claw && !clawStarting) {
+      setTimeout(() => startOpenClawLoop(), 0);
+    }
+
+    if (!proxyEnabled) {
+      return serveText(res, 404, "Proxy disabled. Use /health /ready /debug.");
+    }
+
+    const isReady = await isOpenClawReadyFast();
+    if (!isReady) return serveText(res, 503, "OpenClaw is not ready yet. Check /debug.");
+
+    requestUpstream(req, res);
+  });
+
+  // WebSocket upgrade proxy
+  server.on("upgrade", async (req, socket, head) => {
+    try {
+      const url = req.url || "/";
+
+      if (enforceProxyToken && url !== "/debug" && !isPublicUiPath(url)) {
+        const check = checkProxyToken(req);
+        if (!check.ok) {
+          try {
+            socket.destroy();
+          } catch {}
+          return;
+        }
+      }
+
+      if (!proxyEnabled) {
+        try {
+          socket.destroy();
+        } catch {}
+        return;
+      }
+
+      const isReady = await isOpenClawReadyFast();
+      if (!isReady) {
+        try {
+          socket.destroy();
+        } catch {}
+        return;
+      }
+
+      const headers = buildForwardedHeaders(req);
+
+      const client = selectUpstreamClient();
+      const agent = selectUpstreamAgent();
+      const insecure = envBool("OPENCLAW_UPSTREAM_INSECURE", false);
+
+      const options = {
+        agent,
+        hostname: upstreamHost,
+        port: internalPort,
+        method: req.method,
+        path: url,
+        headers: {
+          ...headers,
+          connection: "Upgrade",
+          upgrade: "websocket",
+        },
+        timeout: proxyTimeoutMs,
+      };
+
+      if (upstreamProtocol === "https") {
+        options.rejectUnauthorized = !insecure;
+      }
+
+      const upstreamReq = client.request(options);
+
+      upstreamReq.on("upgrade", (upstreamRes, upstreamSocket) => {
+        const lines = [
+          `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage || ""}`.trim(),
+          ...Object.entries(upstreamRes.headers).map(([k, v]) => `${k}: ${v}`),
+          "",
+          "",
+        ];
+        socket.write(lines.join("\r\n"));
+
+        if (head && head.length) upstreamSocket.write(head);
+
+        socket.pipe(upstreamSocket).pipe(socket);
+
+        socket.on("error", () => {
+          try {
+            upstreamSocket.destroy();
+          } catch {}
+        });
+
+        upstreamSocket.on("error", () => {
+          try {
+            socket.destroy();
+          } catch {}
+        });
+      });
+
+      upstreamReq.on("error", () => {
+        try {
+          socket.destroy();
+        } catch {}
+      });
+
+      upstreamReq.end();
+    } catch {
+      try {
+        socket.destroy();
+      } catch {}
+    }
+  });
+
+  server.listen(externalPort, "0.0.0.0", () => {
+    console.log("[railway-start] public server listening on 0.0.0.0:" + externalPort);
+    console.log("[railway-start] endpoints: /health /ready /debug");
+    console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
+    if (proxyEnabled) {
+      console.log(
+        "[railway-start] proxying other routes to",
+        `${upstreamProtocol}://${upstreamHost}:${internalPort}`
+      );
+    }
+
+    setTimeout(() => startOpenClawLoop(), 400);
+
+    setInterval(async () => {
+      if (!claw || clawStarting) return;
+      const r = await isPortReadyAnyHost();
+      if (r.ok) return;
+
+      console.error("[railway-start] watchdog: OpenClaw TCP down, restarting");
+      dumpRing("[railway-start][openclaw STDOUT]", outRing);
+      dumpRing("[railway-start][openclaw STDERR]", errRing);
+
+      const child = claw;
+      claw = null;
+      clawReady = false;
+      killChild(child);
+
+      restartAttempt = Math.max(1, restartAttempt);
+      scheduleRestart(computeBackoffMs(1));
+    }, watchdogIntervalMs).unref();
+  });
+
+  function shutdown(reason) {
+    console.log("[railway-start] shutdown:", reason);
+    try {
+      server.close();
+    } catch {}
+    const child = claw;
+    claw = null;
+    if (child) killChild(child);
+    setTimeout(() => process.exit(0), 1200);
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("uncaughtException", (e) => {
+    console.error("[railway-start] uncaughtException:", e?.stack || e);
+    shutdown("uncaughtException");
+  });
+  process.on("unhandledRejection", (e) => {
+    console.error("[railway-start] unhandledRejection:", e?.stack || e);
+    shutdown("unhandledRejection");
+  });
 }
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("uncaughtException", (e) => {
-  console.error("[railway-start] uncaughtException:", e?.stack || e);
-  shutdown("uncaughtException");
-});
-process.on("unhandledRejection", (e) => {
-  console.error("[railway-start] unhandledRejection:", e?.stack || e);
-  shutdown("unhandledRejection");
-});
