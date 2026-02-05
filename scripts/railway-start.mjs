@@ -2,9 +2,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
-import net from "net";
-import { spawn } from "node:child_process";
-import { execSync } from "node:child_process";
+import net from "node:net";
+import { spawn, execSync } from "node:child_process";
 
 console.log("[railway-start] starting");
 
@@ -97,16 +96,13 @@ function tcpCheck(host, port, timeoutMs = 800) {
   });
 }
 
-// Check if openclaw binary exists
-function checkOpenClawBinary() {
+function whichOpenClaw() {
   try {
-    const result = execSync("which openclaw", { encoding: "utf8" }).trim();
-    console.log("[railway-start] openclaw binary found at:", result);
-    return true;
-  } catch (e) {
-    console.log("[railway-start] ERROR: openclaw binary not found in PATH");
-    console.log("[railway-start] PATH:", process.env.PATH);
-    return false;
+    const p = execSync("which openclaw", { encoding: "utf8" }).trim();
+    if (p) return p;
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -168,23 +164,31 @@ let claw = null;
 let clawStarting = false;
 let clawReady = false;
 
-function startOpenClaw() {
-  if (clawStarting) {
-    console.log("[railway-start] OpenClaw already starting, skipping");
-    return;
-  }
-  
-  if (!checkOpenClawBinary()) {
-    console.log("[railway-start] Cannot start OpenClaw - binary not found");
-    clawStarting = false;
-    return;
-  }
-  
-  clawStarting = true;
-
+function spawnOpenClawProcess() {
   const childEnv = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
 
+  const openclawPath = whichOpenClaw();
+  if (openclawPath) {
+    const args = [
+      "gateway",
+      "--allow-unconfigured",
+      "--bind",
+      "127.0.0.1",
+      "--port",
+      String(internalPort),
+    ];
+    console.log("[railway-start] exec:", ["openclaw", ...args].join(" "));
+    return spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
+  }
+
+  // Fallback: run the node entrypoint directly if openclaw binary is missing
+  const entry = "dist/index.js";
+  if (!fs.existsSync(entry)) {
+    throw new Error("Neither openclaw binary nor dist/index.js found. Build output missing.");
+  }
+
   const args = [
+    entry,
     "gateway",
     "--allow-unconfigured",
     "--bind",
@@ -192,73 +196,78 @@ function startOpenClaw() {
     "--port",
     String(internalPort),
   ];
+  console.log("[railway-start] exec:", ["node", ...args].join(" "));
+  return spawn("node", args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
+}
 
-  console.log("[railway-start] Starting OpenClaw with command:", ["openclaw", ...args].join(" "));
-  console.log("[railway-start] Environment: OPENCLAW_STATE_DIR =", stateDir);
-  
-  try {
-    claw = spawn("openclaw", args, { 
-      stdio: ["ignore", "pipe", "pipe"],
-      env: childEnv 
-    });
-    
-    console.log("[railway-start] OpenClaw process spawned with PID:", claw.pid);
-    
-    // Capture stdout
-    claw.stdout.on("data", (data) => {
-      const lines = data.toString().split("\n").filter(Boolean);
-      lines.forEach(line => console.log("[openclaw]", line));
-      
-      // Check if OpenClaw is ready
-      if (line.includes("listening") || line.includes("started")) {
-        clawReady = true;
-      }
-    });
-    
-    // Capture stderr
-    claw.stderr.on("data", (data) => {
-      const lines = data.toString().split("\n").filter(Boolean);
-      lines.forEach(line => console.error("[openclaw ERROR]", line));
-    });
-    
-  } catch (e) {
-    console.log("[railway-start] spawn threw:", e?.message || e);
-    console.log("[railway-start] Full error:", e);
-    clawStarting = false;
+function startOpenClaw() {
+  if (clawStarting || claw) {
+    console.log("[railway-start] OpenClaw already starting or running, skipping");
     return;
   }
 
+  clawStarting = true;
+  clawReady = false;
+
+  try {
+    claw = spawnOpenClawProcess();
+    console.log("[railway-start] OpenClaw spawned PID:", claw.pid);
+  } catch (e) {
+    console.error("[railway-start] Failed to spawn OpenClaw:", e?.message || e);
+    claw = null;
+    clawStarting = false;
+    setTimeout(startOpenClaw, 3000);
+    return;
+  }
+
+  const markReadyFromLine = (s) => {
+    const t = String(s || "").toLowerCase();
+    if (t.includes("listening") || t.includes("started") || t.includes("ready")) {
+      clawReady = true;
+    }
+  };
+
+  claw.stdout.on("data", (data) => {
+    const lines = data.toString().split("\n").filter(Boolean);
+    for (const ln of lines) {
+      console.log("[openclaw]", ln);
+      markReadyFromLine(ln);
+    }
+  });
+
+  claw.stderr.on("data", (data) => {
+    const lines = data.toString().split("\n").filter(Boolean);
+    for (const ln of lines) {
+      console.error("[openclaw ERROR]", ln);
+      markReadyFromLine(ln);
+    }
+  });
+
   claw.on("exit", (code, signal) => {
-    console.log("[railway-start] OpenClaw exited - code:", code, "signal:", signal);
+    console.log("[railway-start] OpenClaw exited code:", code, "signal:", signal);
     claw = null;
     clawStarting = false;
     clawReady = false;
-    
-    // Retry after 3 seconds
-    console.log("[railway-start] Will retry OpenClaw in 3 seconds...");
     setTimeout(startOpenClaw, 3000);
   });
 
   claw.on("error", (err) => {
-    console.log("[railway-start] OpenClaw spawn error:", err?.message || err);
-    console.log("[railway-start] Full error:", err);
+    console.error("[railway-start] OpenClaw process error:", err?.message || err);
     claw = null;
     clawStarting = false;
     clawReady = false;
-    
-    // Retry after 3 seconds
     setTimeout(startOpenClaw, 3000);
   });
 
+  // Done starting attempt
   clawStarting = false;
 }
 
-// Start the public server immediately so Railway healthcheck can succeed.
+// Public server so Railway can healthcheck the container
 const server = http.createServer(async (req, res) => {
   const url = req.url || "/";
 
   if (url === "/health") {
-    // Always 200 so Railway stops killing the deploy.
     res.statusCode = 200;
     res.setHeader("content-type", "text/plain");
     res.end("ok");
@@ -272,7 +281,7 @@ const server = http.createServer(async (req, res) => {
     res.end(ok ? "ready" : "not-ready");
     return;
   }
-  
+
   if (url === "/debug") {
     const ok = await tcpCheck("127.0.0.1", internalPort, 800);
     res.statusCode = 200;
@@ -281,24 +290,24 @@ const server = http.createServer(async (req, res) => {
       externalPort,
       internalPort,
       clawReady,
-      clawProcess: claw ? "running" : "not running",
+      clawRunning: !!claw,
       clawPid: claw?.pid || null,
       tcpCheck: ok,
       stateDir,
+      hasOpenclawBinary: !!whichOpenClaw(),
+      enforceTokenAuth,
     }, null, 2));
     return;
   }
 
-  // Check if OpenClaw is reachable before proxying
   const isReady = await tcpCheck("127.0.0.1", internalPort, 500);
   if (!isReady) {
     res.statusCode = 503;
     res.setHeader("content-type", "text/plain");
-    res.end("OpenClaw is not ready yet. Check /debug for status or /ready for health.");
+    res.end("OpenClaw is not ready yet. Check /debug.");
     return;
   }
 
-  // Proxy HTTP to OpenClaw
   const proxyReq = http.request(
     {
       hostname: "127.0.0.1",
@@ -322,12 +331,13 @@ const server = http.createServer(async (req, res) => {
     console.log("[railway-start] Proxy error:", err.message);
     res.statusCode = 502;
     res.setHeader("content-type", "text/plain");
-    res.end(`Bad gateway: ${err?.message || err}. OpenClaw may not be running. Check /debug for details.`);
+    res.end(`Bad gateway: ${err?.message || err}. Check /debug.`);
   });
 
   req.pipe(proxyReq);
 });
 
+// Simple TCP tunnel for WebSocket upgrade
 server.on("upgrade", (req, socket, head) => {
   const upstream = net.connect(internalPort, "127.0.0.1", () => {
     upstream.write(
@@ -349,14 +359,8 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 server.listen(externalPort, "0.0.0.0", () => {
-  console.log("[railway-start] ========================================");
-  console.log("[railway-start] Public server listening on 0.0.0.0:" + externalPort);
-  console.log("[railway-start] /health - Always returns 200 (for Railway)");
-  console.log("[railway-start] /ready - Returns 200 if OpenClaw is reachable");
-  console.log("[railway-start] /debug - Shows diagnostic information");
-  console.log("[railway-start] All other routes proxy to OpenClaw on 127.0.0.1:" + internalPort);
-  console.log("[railway-start] ========================================");
-  
-  // Wait a moment for server to be fully ready, then start OpenClaw
+  console.log("[railway-start] public server listening on 0.0.0.0:" + externalPort);
+  console.log("[railway-start] endpoints: /health /ready /debug");
+  console.log("[railway-start] proxying other routes to 127.0.0.1:" + internalPort);
   setTimeout(startOpenClaw, 500);
 });
