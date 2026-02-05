@@ -157,8 +157,11 @@ const configB = path.join(stateDir, "config.json");
 
 const base = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 base.gateway = base.gateway || {};
+
+// CRITICAL FIX: Remove the 'bind' field - it's CLI-only, not allowed in config!
+// base.gateway.bind = "127.0.0.1";  // ❌ THIS WAS THE BUG
+
 base.gateway.port = Number(internalPort);
-base.gateway.bind = "127.0.0.1";
 base.gateway.trustedProxies = uniq([
   ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
   ...parseTrustedProxies(),
