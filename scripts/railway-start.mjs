@@ -20,6 +20,10 @@
 // 4) Keeps selfSanitize behavior: strips proxy-derived headers and does not add x-forwarded-* back.
 // 5) Keeps OpenClaw bind logic: proxy mode prefers loopback, fallback to lan after failures.
 // 6) WebSocket proxy now handles non-101 upstream responses safely (no hanging sockets).
+//
+// Update in this version
+// - Do NOT write gateway.auth unless token auth is explicitly enabled.
+//   Some OpenClaw builds reject gateway.auth.mode or the "none" enum and will exit on boot.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -183,7 +187,12 @@ function isLoopbackHost(h) {
 
 function isLocalHostHeader(hostHeader) {
   const hostOnly = parseHostOnly(hostHeader);
-  return hostOnly === "127.0.0.1" || hostOnly === "localhost" || hostOnly === "[::1]" || hostOnly === "::1";
+  return (
+    hostOnly === "127.0.0.1" ||
+    hostOnly === "localhost" ||
+    hostOnly === "[::1]" ||
+    hostOnly === "::1"
+  );
 }
 
 // IPv6-safe local Host header builder
@@ -405,13 +414,14 @@ function buildSanitizedConfig() {
   ]);
   cfg.gateway.trustedProxies = trusted;
 
-  // Always set explicit auth mode to avoid "implicit token" behavior on some builds.
+  // Only write auth settings if token auth is explicitly enabled.
+  // Some OpenClaw builds reject gateway.auth.mode and/or the "none" enum.
   if (enforceTokenAuth && token) {
     cfg.gateway.auth = { mode: "token", token };
     console.log("[railway-start] gateway auth enabled (token)");
   } else {
-    cfg.gateway.auth = { mode: "none" };
-    console.log("[railway-start] gateway auth disabled");
+    delete cfg.gateway.auth;
+    console.log("[railway-start] gateway auth not configured");
   }
 
   return { cfg, trusted };
@@ -438,14 +448,16 @@ function buildCompatConfig() {
     delete base.gateway.pairingRequired;
   }
 
+  // Only write auth settings if token auth is explicitly enabled.
+  // Some OpenClaw builds reject gateway.auth.mode and/or the "none" enum.
   if (enforceTokenAuth && token) {
     base.gateway.auth = base.gateway.auth || {};
     base.gateway.auth.mode = "token";
     base.gateway.auth.token = token;
     console.log("[railway-start] gateway auth enabled (token)");
   } else {
-    base.gateway.auth = { mode: "none" };
-    console.log("[railway-start] gateway auth disabled");
+    delete base.gateway.auth;
+    console.log("[railway-start] gateway auth not configured");
   }
 
   return { cfg: base, trusted };
