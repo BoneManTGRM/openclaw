@@ -7,7 +7,7 @@
 // - Writes a safe OpenClaw config (openclaw.json + config.json) with gateway.port and gateway.trustedProxies.
 // - Prevents pairing-required loops on Railway by stripping proxy-derived headers in selfSanitize mode.
 // - Fixes loopback Host header mismatch that can flip OpenClaw into "remote" mode.
-// - Optionally writes auth-profiles.json from env vars or ANTHROPIC_API_KEY.
+// - Optionally writes auth-profiles.json from env vars or ANTHROPIC_API_KEY / OPENAI_API_KEY.
 //
 // Notes
 // - This file intentionally uses ASCII quotes and normal "--" flags.
@@ -101,12 +101,10 @@ function canWriteDir(dir) {
 function parseTrustedProxies() {
   const override = String(process.env.OPENCLAW_TRUSTED_PROXIES || "").trim();
   const base = [
-    // Common private ranges
     "100.64.0.0/10",
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
-    // Localhost
     "127.0.0.1/32",
     "::1/128",
   ];
@@ -177,26 +175,19 @@ function isLocalHostHeader(hostHeader) {
 function buildLocalHostHeader(hostForUpstream, portForUpstream) {
   const hh = String(hostForUpstream || "").trim();
   if (!hh) return `127.0.0.1:${portForUpstream}`;
-  // If already has port, keep it (except bracketed ::1 which already includes :)
   if (hh.includes(":") && !hh.startsWith("[::1]")) return hh;
   return `${hh}:${portForUpstream}`;
 }
 
-// Railway port (public)
 const externalPort = envInt("PORT", 8080);
-
-// Internal port for OpenClaw when proxying (default)
 const internalPortDefault = envInt("OPENCLAW_INTERNAL_PORT", 8081);
 
-// If OPENCLAW_LISTEN_ON_EXTERNAL=1, OpenClaw binds to externalPort.
-// In that mode this wrapper MUST NOT bind to externalPort.
 const openclawListenOnExternal = envBool("OPENCLAW_LISTEN_ON_EXTERNAL", false);
 const internalPort = openclawListenOnExternal ? externalPort : internalPortDefault;
 
 const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
-// Self sanitize config to a strict minimal object that cannot contain unknown keys.
 const selfSanitize = envBool("OPENCLAW_SELF_SANITIZE", true);
 
 let startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 120000);
@@ -205,31 +196,25 @@ startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
 const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
 const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
 
-// Upstream protocol for proxy mode
 const upstreamProtocol =
   envStr("OPENCLAW_UPSTREAM_PROTOCOL", "http").toLowerCase() === "https"
     ? "https"
     : "http";
 const upstreamHost = envStr("OPENCLAW_UPSTREAM_HOST", "127.0.0.1");
 
-// Optional overrides
 const forwardedProtoOverride = envStr("OPENCLAW_FORWARDED_PROTO", "");
 const forwardedHostOverride = envStr("OPENCLAW_FORWARDED_HOST", "");
 const upstreamHostHeaderOverride = envStr("OPENCLAW_UPSTREAM_HOST_HEADER", "");
 
-// OpenClaw expects bind MODEs here, not IPs.
 const bindPrimary = envStr("OPENCLAW_BIND", "loopback");
 const bindFallback = envStr("OPENCLAW_BIND_FALLBACK", "lan");
 
 const useShellForLocalBin = envBool("OPENCLAW_SHELL_LOCAL_BIN", true);
 
-// Optional: enforce token on inbound requests to the wrapper proxy.
 const enforceProxyToken = envBool("OPENCLAW_PROXY_ENFORCE_TOKEN", false);
 
-// Proxy enabled by default, disabled automatically if OpenClaw is listening on external.
 const proxyEnabled = envBool("OPENCLAW_PROXY_ENABLED", !openclawListenOnExternal);
 
-// Use --force only if explicitly requested AND lsof exists.
 const forceRequested = envBool("OPENCLAW_FORCE", false);
 const forceEnabled = forceRequested && hasWorkingLsof();
 
@@ -274,7 +259,6 @@ safeMkdir(stateDir);
 const configA = path.join(stateDir, "openclaw.json");
 const configB = path.join(stateDir, "config.json");
 
-// Read existing config (if any) then sanitize.
 const existing = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 const existingGateway =
   typeof existing?.gateway === "object" && existing.gateway ? existing.gateway : {};
@@ -291,10 +275,13 @@ function buildSanitizedConfig() {
   ]);
   cfg.gateway.trustedProxies = trusted;
 
+  // Always set an explicit auth mode.
+  // This prevents builds that interpret missing auth as token mode.
   if (enforceTokenAuth && token) {
     cfg.gateway.auth = { mode: "token", token };
     console.log("[railway-start] gateway auth enabled (token)");
   } else {
+    cfg.gateway.auth = { mode: "none" };
     console.log("[railway-start] gateway auth disabled");
   }
 
@@ -313,7 +300,6 @@ function buildCompatConfig() {
   ]);
   base.gateway.trustedProxies = trusted;
 
-  // Strip known-invalid keys
   delete base.trustProxy;
   delete base.trustedProxies;
   if (base.gateway) {
@@ -322,13 +308,14 @@ function buildCompatConfig() {
     delete base.gateway.pairingRequired;
   }
 
+  // Always set an explicit auth mode.
   if (enforceTokenAuth && token) {
     base.gateway.auth = base.gateway.auth || {};
     base.gateway.auth.mode = "token";
     base.gateway.auth.token = token;
     console.log("[railway-start] gateway auth enabled (token)");
   } else {
-    if (base.gateway.auth) delete base.gateway.auth;
+    base.gateway.auth = { mode: "none" };
     console.log("[railway-start] gateway auth disabled");
   }
 
@@ -368,15 +355,17 @@ safeWriteJson(configB, configToWrite);
 // Priority:
 // 1) OPENCLAW_AUTH_PROFILES_JSON (raw JSON string)
 // 2) OPENCLAW_AUTH_PROFILES_B64  (base64 JSON)
-// 3) ANTHROPIC_API_KEY           (auto-generate minimal auth-profiles.json)
+// 3) OPENAI_API_KEY              (auto-generate minimal auth-profiles.json)
+// 4) ANTHROPIC_API_KEY           (auto-generate minimal auth-profiles.json)
 (function writeAuthProfilesIfProvided() {
   const jsonRaw = envStr("OPENCLAW_AUTH_PROFILES_JSON", "").trim();
   const b64 = envStr("OPENCLAW_AUTH_PROFILES_B64", "").trim();
+  const openaiKey = envStr("OPENAI_API_KEY", "").trim();
   const anthropicKey = envStr("ANTHROPIC_API_KEY", "").trim();
 
-  if (!jsonRaw && !b64 && !anthropicKey) {
+  if (!jsonRaw && !b64 && !openaiKey && !anthropicKey) {
     console.log(
-      "[railway-start] no auth profiles env vars found (OPENCLAW_AUTH_PROFILES_JSON, OPENCLAW_AUTH_PROFILES_B64, ANTHROPIC_API_KEY)"
+      "[railway-start] no auth profiles env vars found (OPENCLAW_AUTH_PROFILES_JSON, OPENCLAW_AUTH_PROFILES_B64, OPENAI_API_KEY, ANTHROPIC_API_KEY)"
     );
     return;
   }
@@ -403,13 +392,20 @@ safeWriteJson(configB, configToWrite);
     return;
   }
 
-  if (anthropicKey) {
-    console.log("[railway-start] auto-generating auth-profiles.json from ANTHROPIC_API_KEY");
-    const authObj = {
-      anthropic: {
-        apiKey: anthropicKey,
-      },
-    };
+  // Auto generate minimal auth profiles from keys
+  if (openaiKey || anthropicKey) {
+    const authObj = {};
+    if (openaiKey) authObj.openai = { apiKey: openaiKey };
+    if (anthropicKey) authObj.anthropic = { apiKey: anthropicKey };
+
+    if (openaiKey && anthropicKey) {
+      console.log("[railway-start] auto-generating auth-profiles.json from OPENAI_API_KEY + ANTHROPIC_API_KEY");
+    } else if (openaiKey) {
+      console.log("[railway-start] auto-generating auth-profiles.json from OPENAI_API_KEY");
+    } else {
+      console.log("[railway-start] auto-generating auth-profiles.json from ANTHROPIC_API_KEY");
+    }
+
     safeWriteJson(authPath, authObj);
   }
 })();
@@ -495,7 +491,6 @@ function resolveOpenClawCommand() {
   return null;
 }
 
-// OpenClaw expects bind MODEs here, not IPs.
 function buildOpenClawArgs(bindMode) {
   const args = ["gateway", "--allow-unconfigured", "--bind", String(bindMode), "--port", String(internalPort)];
 
@@ -541,7 +536,6 @@ function spawnOpenClawProcess(bindMode) {
 async function isPortReadyAnyHost() {
   const hosts = ["127.0.0.1", "localhost", "::1"];
   for (const h of hosts) {
-    // eslint-disable-next-line no-await-in-loop
     const ok = await tcpCheck(h, internalPort, 700);
     if (ok) return { ok: true, host: h };
   }
@@ -778,7 +772,6 @@ function isPublicUiPath(url) {
   return false;
 }
 
-// Headers that can trigger OpenClaw proxy detection.
 const PROXY_DERIVED_HEADERS = new Set([
   "forwarded",
   "x-forwarded-for",
@@ -814,7 +807,6 @@ function pickHostHeaderForUpstream(req, xfHost) {
   const inboundHost = req.headers?.host || "";
   const inboundIsLocal = isLocalHostHeader(inboundHost);
 
-  // If proxying to loopback and inbound Host is not local, rewrite Host to local for OpenClaw.
   if (isLoopbackHost(upstreamHost) && !inboundIsLocal) {
     return buildLocalHostHeader(upstreamHost, internalPort);
   }
@@ -825,7 +817,6 @@ function pickHostHeaderForUpstream(req, xfHost) {
 function buildForwardedHeaders(req) {
   const remoteAddr = req.socket?.remoteAddress || "";
 
-  // Build header names without writing "-" literals in case you are copying into environments that mangle punctuation.
   const D = String.fromCharCode(45);
   const H_XFF = "x" + D + "forwarded" + D + "for";
   const H_XFP = "x" + D + "forwarded" + D + "proto";
@@ -863,14 +854,12 @@ function buildForwardedHeaders(req) {
 
   cleaned.host = pickHostHeaderForUpstream(req, xfHost);
 
-  // Self sanitize: strip incoming proxy-derived headers and do not add forwarded headers back.
   if (selfSanitize) {
     const stripped = stripProxyDerivedHeaders(cleaned);
     stripped.host = cleaned.host || stripped.host || "";
     return stripped;
   }
 
-  // Normal mode: forward proxy headers, but keep Host local when upstream is loopback.
   return {
     ...cleaned,
     [H_XFP]: String(xfProto),
@@ -926,7 +915,6 @@ function requestUpstream(req, res) {
     timeout: proxyTimeoutMs,
   };
 
-  // Only https supports rejectUnauthorized
   if (upstreamProtocol === "https") {
     options.rejectUnauthorized = !insecure;
   }
@@ -995,7 +983,6 @@ if (openclawListenOnExternal) {
     shutdown("unhandledRejection");
   });
 
-  // Keep Node alive even if OpenClaw exits and restarts are scheduled
   setInterval(() => {}, 1 << 30).unref();
 } else {
   const server = http.createServer(async (req, res) => {
@@ -1170,10 +1157,7 @@ if (openclawListenOnExternal) {
     console.log("[railway-start] endpoints: /health /ready /debug");
     console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
     if (proxyEnabled) {
-      console.log(
-        "[railway-start] proxying other routes to",
-        `${upstreamProtocol}://${upstreamHost}:${internalPort}`
-      );
+      console.log("[railway-start] proxying other routes to", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
     }
 
     setTimeout(() => startOpenClawLoop(), 400);
