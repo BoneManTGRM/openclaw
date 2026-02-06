@@ -32,12 +32,18 @@
 // - Watchdog uses the same readiness check for better signal.
 // - Do NOT write gateway.auth unless token auth is explicitly enabled.
 //   Some OpenClaw builds reject gateway.auth.mode or the "none" enum and will exit on boot.
+// - Prevents confusing token mismatch loops by default:
+//   If OPENCLAW_ENFORCE_TOKEN_AUTH=0, this wrapper will NOT pass OPENCLAW_GATEWAY_TOKEN to the child
+//   unless OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD=1 is set.
+//   The wrapper can still use the token for proxy-level auth if OPENCLAW_PROXY_ENFORCE_TOKEN=1.
+// - /debug now includes a token fingerprint (hash prefix + length) without revealing the token.
 
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
+import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 
 console.log("[railway-start] starting");
@@ -303,6 +309,13 @@ function headersToLines(headers) {
   return out;
 }
 
+function tokenFingerprint(tok) {
+  const t = String(tok || "");
+  if (!t) return { present: false, len: 0, sha256_8: "" };
+  const hex = crypto.createHash("sha256").update(t).digest("hex");
+  return { present: true, len: t.length, sha256_8: hex.slice(0, 8) };
+}
+
 // Railway port (public)
 const externalPort = envInt("PORT", 8080);
 
@@ -317,6 +330,11 @@ const internalPort = openclawListenOnExternal ? externalPort : internalPortDefau
 
 const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
+
+// If token auth is not enforced, default to NOT passing OPENCLAW_GATEWAY_TOKEN into the child.
+// This prevents accidental "token_mismatch" loops when the UI has an old token stored.
+const passGatewayTokenToChild =
+  enforceTokenAuth || envBool("OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD", false);
 
 // Self sanitize config to a strict minimal object that cannot contain unknown keys.
 const selfSanitize = envBool("OPENCLAW_SELF_SANITIZE", true);
@@ -386,13 +404,17 @@ if (process.env.OPENCLAW_STATE_DIR && canWriteDir(process.env.OPENCLAW_STATE_DIR
   }
 }
 
+const tokenFp = tokenFingerprint(token);
+
 console.log("[railway-start] external PORT =", externalPort);
 console.log("[railway-start] internal OpenClaw port =", internalPort);
 console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
 console.log("[railway-start] openclawListenOnExternal =", openclawListenOnExternal ? "yes" : "no");
 console.log("[railway-start] chosen stateDir =", stateDir);
 console.log("[railway-start] token present =", token ? "yes" : "no");
+console.log("[railway-start] token fingerprint =", tokenFp.present ? `${tokenFp.sha256_8} (len ${tokenFp.len})` : "none");
 console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
+console.log("[railway-start] pass gateway token to child =", passGatewayTokenToChild ? "yes" : "no");
 console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" : "no");
 console.log("[railway-start] selfSanitize =", selfSanitize ? "yes" : "no");
 console.log("[railway-start] startupTimeoutMs =", startupTimeoutMs);
@@ -664,6 +686,12 @@ function currentBindForAttempt(attempt) {
 function spawnOpenClawProcess(bindMode) {
   const childEnv = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
 
+  // Prevent accidental token enforcement inside OpenClaw when you only want proxy-level token checks
+  if (!passGatewayTokenToChild) {
+    delete childEnv.OPENCLAW_GATEWAY_TOKEN;
+    delete childEnv.OPENCLAW_ENFORCE_TOKEN_AUTH;
+  }
+
   const resolved = resolveOpenClawCommand();
   if (!resolved) {
     throw new Error(
@@ -695,6 +723,9 @@ async function isPortReadyAnyHost() {
   }
   return { ok: false, host: null };
 }
+
+const proxyAgentHttp = new http.Agent({ keepAlive: true });
+const proxyAgentHttps = new https.Agent({ keepAlive: true });
 
 function selectUpstreamClient() {
   return upstreamProtocol === "https" ? https : http;
@@ -815,6 +846,14 @@ async function waitForOpenClawReady(timeoutMs, child) {
 
   return false;
 }
+
+let claw = null;
+let clawStarting = false;
+let clawReady = false;
+
+let restartAttempt = 0;
+let startLoopId = 0;
+let restartScheduled = false;
 
 async function startOpenClawLoop() {
   const myLoopId = ++startLoopId;
@@ -968,9 +1007,6 @@ async function startOpenClawLoop() {
   clawReady = true;
   console.log("[railway-start] OpenClaw is ready");
 }
-
-const proxyAgentHttp = new http.Agent({ keepAlive: true });
-const proxyAgentHttps = new https.Agent({ keepAlive: true });
 
 function normalizeToken(s) {
   return String(s || "").trim();
@@ -1244,6 +1280,8 @@ if (openclawListenOnExternal) {
 
     if (url === "/debug") {
       const sig = await isOpenClawReadySignal();
+      const tfp = tokenFingerprint(token);
+
       return serveJson(res, 200, {
         externalPort,
         internalPort,
@@ -1252,29 +1290,42 @@ if (openclawListenOnExternal) {
         upstreamProtocol,
         upstreamHost,
         upstreamHostHeaderOverride,
+
         clawReady,
         clawRunning: !!claw,
         clawPid: claw?.pid || null,
+
         readyMode: readyCheckMode,
         readyPath,
         readyExpect,
         readyOk: sig.ok,
         readyDetail: sig.detail,
+
         stateDir,
+
         enforceTokenAuth,
+        passGatewayTokenToChild,
+
         enforceProxyToken,
         selfSanitize,
+
+        tokenFingerprint: tfp,
+
         startupTimeoutMs,
         watchdogIntervalMs,
         proxyTimeoutMs,
+
         restartAttempt,
         restartScheduled,
         clawStarting,
+
         bindPrimary,
         bindFallback,
+
         OPENCLAW_SHELL_LOCAL_BIN: useShellForLocalBin,
         OPENCLAW_FORCE: forceRequested,
         OPENCLAW_FORCE_ENABLED: forceEnabled,
+
         trustedProxies: trusted,
         outTail: outRing.slice(-120),
         errTail: errRing.slice(-120),
