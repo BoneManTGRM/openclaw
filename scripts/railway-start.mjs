@@ -5,7 +5,7 @@
 // - Starts OpenClaw gateway on an internal port (default 8081) and proxies Railway PORT to it.
 // - Optionally lets OpenClaw bind directly to Railway PORT when OPENCLAW_LISTEN_ON_EXTERNAL=1.
 // - Writes a safe OpenClaw config (openclaw.json + config.json) with gateway.port and gateway.trustedProxies.
-// - Prevents pairing-required loops on Railway by stripping proxy-derived headers in selfSanitize mode.
+// - Prevents pairing-required loops on Railway by sanitizing proxy-derived headers in selfSanitize mode.
 // - Fixes loopback Host header mismatch that can flip OpenClaw into "remote" mode.
 // - Optionally writes auth-profiles.json from env vars or ANTHROPIC_API_KEY / OPENAI_API_KEY.
 //
@@ -34,39 +34,19 @@
 // - Harden destroyBoth(): attempt end() before destroy() to avoid stuck half-open sockets on mobile
 // - Add gentle delays between end() and destroy() to reduce Safari "closed before connect" incidence
 //
-// NEW fixes for "closed before connect" on Railway + Safari
-// - Stop rewriting Host to 127.0.0.1 by default (that was showing up in OpenClaw logs as host=127.0.0.1:8081)
-// - In selfSanitize mode, do not blindly strip all forwarded headers. Instead, rebuild a minimal, safe
-//   set of x-forwarded-* based on the inbound request and overrides. This keeps OpenClaw aware of
-//   external https origin while still preventing untrusted proxy header loops.
-// - Add OPENCLAW_UPSTREAM_FORCE_LOCAL_HOST=1 to restore the old Host rewrite behavior if you truly need it.
-//
-// Extra hardening in this update
-// - WebSocket handshake: write the upstream "uHead" to the client socket (not the other way around)
-// - WebSocket: ensure sockets never time out during upgrade piping (setTimeout(0))
-// - WebSocket: setKeepAlive(true) for long-lived connections
-//
-// EXTRA in this update (requested style stability)
-// - WebSocket: pause inbound client socket immediately, resume only after piping is attached
-// - WebSocket: configurable gentle close delay (OPENCLAW_WS_CLOSE_DELAY_MS) to reduce iOS/Safari flakiness
-//
-// IMPORTANT FIX FOR YOUR CURRENT LOGS
-// Your logs show OpenClaw still complaining:
-//   "[ws] Proxy headers detected from untrusted address ... Configure gateway.trustedProxies ..."
-// Even though we write trustedProxies, the fastest practical fix is to NOT send any x-forwarded-*
-// headers on WebSocket upgrade requests (keep Host + Origin intact). That prevents OpenClaw from
-// entering its proxy-detection path for WS and stops the pairing/local-detection mismatch loop.
-//
+// FIX FOR YOUR CURRENT LOGS (Loopback connection with non-local Host header)
+// Your logs show:
+//   [ws] Loopback connection with non-local Host header. Treating it as remote.
+// That happens when the proxy connects to OpenClaw over 127.0.0.1 but forwards Host as your public domain.
+// OpenClaw treats that as a remote connection and may refuse or close before connect.
+// The fix: for WS upgrades, force upstream Host to local (127.0.0.1:8081) by default, and ALSO send a minimal
+// rebuilt set of x-forwarded-* and x-real-ip so OpenClaw can still understand the true external origin.
 // New env toggle (default ON):
+//   OPENCLAW_WS_FORCE_LOCAL_HOST=1
+//
+// Existing env toggle (still honored):
 //   OPENCLAW_WS_STRIP_PROXY_HEADERS=1
-// This strips x-forwarded-* and related proxy-derived headers ONLY for WS upgrades.
-//
-// PATCHES APPLIED IN THIS UPDATE (relative to the file you pasted)
-// - Host header fallback: if inbound Host is missing, always set a safe local Host for upstream
-// - WS Host fallback: ensure WS upgrade also always has a Host header (some iOS edge cases)
-//
-// Additional hardening in this revision
-// - Ensure upstream sockets also get setNoDelay + keepAlive early via request "socket" events
+// In this revision, "strip" means: remove arbitrary proxy headers, then rebuild the minimal safe set.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -490,8 +470,11 @@ const upstreamHostHeaderOverride = envStr("OPENCLAW_UPSTREAM_HOST_HEADER", "");
 // If true, rewrite Host to local loopback when upstreamHost is loopback.
 const upstreamForceLocalHostHeader = envBool("OPENCLAW_UPSTREAM_FORCE_LOCAL_HOST", false);
 
-// WS: strip proxy-derived headers on upgrade (default ON)
+// WS: strip arbitrary proxy-derived headers on upgrade (default ON)
 const wsStripProxyHeaders = envBool("OPENCLAW_WS_STRIP_PROXY_HEADERS", true);
+
+// WS: force upstream Host to local loopback (default ON, fixes your log)
+const wsForceLocalHostHeader = envBool("OPENCLAW_WS_FORCE_LOCAL_HOST", true);
 
 // OpenClaw expects bind MODEs here, not IPs.
 const bindPrimaryEnv = envStr("OPENCLAW_BIND", "loopback");
@@ -579,12 +562,10 @@ console.log(
   "readyExpect =",
   readyExpectRaw
 );
-console.log(
-  "[railway-start] upstreamForceLocalHostHeader =",
-  upstreamForceLocalHostHeader ? "yes" : "no"
-);
+console.log("[railway-start] upstreamForceLocalHostHeader =", upstreamForceLocalHostHeader ? "yes" : "no");
 console.log("[railway-start] wsCloseDelayMs =", wsCloseDelayMs);
 console.log("[railway-start] wsStripProxyHeaders =", wsStripProxyHeaders ? "yes" : "no");
+console.log("[railway-start] wsForceLocalHostHeader =", wsForceLocalHostHeader ? "yes" : "no");
 
 if (openclawListenOnExternal) {
   console.log("[railway-start] warning: OPENCLAW_LISTEN_ON_EXTERNAL=1 disables wrapper server");
@@ -1154,7 +1135,7 @@ function pickHostHeaderForUpstream(req, xfHost) {
   const inboundHost = req.headers?.host || "";
   const candidate = String(xfHost || inboundHost || "").trim();
 
-  // PATCH: if missing, always provide a safe Host header to upstream
+  // If missing, always provide a safe Host header to upstream
   if (!candidate) {
     return buildLocalHostHeader(upstreamHost, internalPort);
   }
@@ -1234,25 +1215,41 @@ function buildForwardedHeaders(req, opts = {}) {
 
   delete cleaned.forwarded;
 
-  // Ensure upstream Host is correct
-  cleaned.host = pickHostHeaderForUpstream(req, xfHost);
-
-  // WS path: strip proxy-derived headers to prevent OpenClaw proxy detection warnings/loops.
-  if (forWs && wsStripProxyHeaders) {
-    const base = stripProxyDerivedHeaders(cleaned);
-
-    // PATCH: guarantee Host exists for WS upgrade too
-    base.host =
-      String(cleaned.host || base.host || "").trim() || buildLocalHostHeader(upstreamHost, internalPort);
-
-    return applyGatewayTokenToHeaders(base);
-  }
-
   const priorXff = req.headers[H_XFF] || req.headers["x-forwarded-for"];
   let xff = "";
   if (priorXff && remoteAddr) xff = `${safeHeaderValue(priorXff)}, ${remoteAddr}`;
   else if (priorXff) xff = safeHeaderValue(priorXff);
   else if (remoteAddr) xff = remoteAddr;
+
+  // WS path: sanitize arbitrary proxy-derived headers, then rebuild minimal safe forwarded headers.
+  // Also force upstream Host to local loopback by default when upstream is loopback (fixes your logs).
+  if (forWs && wsStripProxyHeaders) {
+    const base = stripProxyDerivedHeaders(cleaned);
+
+    const forcedHost =
+      wsForceLocalHostHeader && isLoopbackHost(upstreamHost)
+        ? buildLocalHostHeader(upstreamHost, internalPort)
+        : pickHostHeaderForUpstream(req, xfHost);
+
+    const rebuilt = {
+      ...base,
+      host: String(forcedHost || "").trim() || buildLocalHostHeader(upstreamHost, internalPort),
+      [H_XFP]: String(safeHeaderValue(xfProto)),
+      [H_XFH]: String(safeHeaderValue(xfHost)),
+      ...(xff ? { [H_XFF]: String(xff) } : {}),
+      ...(remoteAddr ? { [H_XREAL]: String(remoteAddr) } : {}),
+      [H_XFPORT]: String(externalPort),
+    };
+
+    return applyGatewayTokenToHeaders(rebuilt);
+  }
+
+  // Non-strip path: keep most headers, but still ensure Host is sensible.
+  if (forWs && wsForceLocalHostHeader && isLoopbackHost(upstreamHost)) {
+    cleaned.host = buildLocalHostHeader(upstreamHost, internalPort);
+  } else {
+    cleaned.host = pickHostHeaderForUpstream(req, xfHost);
+  }
 
   if (selfSanitize) {
     const base = stripProxyDerivedHeaders(cleaned);
@@ -1778,6 +1775,7 @@ if (openclawListenOnExternal) {
 
         wsCloseDelayMs,
         wsStripProxyHeaders,
+        wsForceLocalHostHeader,
 
         trustedProxies: trusted,
         outTail: outRing.slice(-120),
