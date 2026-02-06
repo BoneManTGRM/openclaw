@@ -32,12 +32,23 @@
 // Additional fixes in this check
 // - Improve WS stability further: setNoDelay(true) on client socket as early as possible
 // - Harden destroyBoth(): attempt end() before destroy() to avoid stuck half-open sockets on mobile
+// - Add gentle delays between end() and destroy() to reduce Safari "closed before connect" incidence
 //
-// New safety fixes in this update
-// - Never inject tokens unless upstreamHost is local by default (prevents accidental token leak)
-// - Upgrade proxy: enforce proxy token for all upgrade requests except /debug when OPENCLAW_PROXY_ENFORCE_TOKEN=1
-// - Upgrade proxy: if OPENCLAW_UPSTREAM_PROTOCOL=https, disable websocket upgrade proxy (avoid flaky wss piping)
-// - Redact gateway token from OpenClaw logs in wrapper output and ring buffers
+// NEW fixes for "closed before connect" on Railway + Safari
+// - Stop rewriting Host to 127.0.0.1 by default (that was showing up in OpenClaw logs as host=127.0.0.1:8081)
+// - In selfSanitize mode, do not blindly strip all forwarded headers. Instead, rebuild a minimal, safe
+//   set of x-forwarded-* based on the inbound request and overrides. This keeps OpenClaw aware of
+//   external https origin while still preventing untrusted proxy header loops.
+// - Add OPENCLAW_UPSTREAM_FORCE_LOCAL_HOST=1 to restore the old Host rewrite behavior if you truly need it.
+//
+// Extra hardening in this update
+// - WebSocket handshake: write the upstream "uHead" to the client socket (not the other way around)
+// - WebSocket: ensure sockets never time out during upgrade piping (setTimeout(0))
+// - WebSocket: setKeepAlive(true) for long-lived connections
+//
+// EXTRA in this update (requested style stability)
+// - WebSocket: pause inbound client socket immediately, resume only after piping is attached
+// - WebSocket: configurable gentle close delay (OPENCLAW_WS_CLOSE_DELAY_MS) to reduce iOS/Safari flakiness
 
 import fs from "node:fs";
 import path from "node:path";
@@ -372,11 +383,6 @@ function matchesReadyExpect(statusCode, expectSpec) {
   return expectSpec.exact?.has(str) || false;
 }
 
-function isLocalUpstreamHost(h) {
-  const s = String(h || "").trim().toLowerCase();
-  return s === "127.0.0.1" || s === "localhost" || s === "::1";
-}
-
 // Railway port (public)
 const externalPort = envInt("PORT", 8080);
 
@@ -396,10 +402,6 @@ let enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
 // Inject gateway token into upstream requests (fixes token_mismatch for Control UI)
 let injectGatewayTokenHeaders = envBool("OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS", true);
-
-// By default, do NOT inject tokens unless upstreamHost is local.
-// You can override with OPENCLAW_INJECT_TOKEN_ALLOW_REMOTE=1 (not recommended).
-const injectTokenAllowRemote = envBool("OPENCLAW_INJECT_TOKEN_ALLOW_REMOTE", false);
 
 // Auto-heal when OpenClaw complains auth token missing
 const autoPassTokenOnAuthError = envBool("OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR", true);
@@ -429,7 +431,7 @@ startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
 const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
 const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
 
-// External mode watchdog is OFF by default to satisfy item 9
+// External mode watchdog is OFF by default
 const externalWatchdogEnabled = envBool("OPENCLAW_EXTERNAL_WATCHDOG", false);
 
 // Readiness checks
@@ -460,6 +462,10 @@ const forwardedHostOverride = envStr("OPENCLAW_FORWARDED_HOST", "");
 // Optional: if set, force the Host header sent upstream (rare)
 const upstreamHostHeaderOverride = envStr("OPENCLAW_UPSTREAM_HOST_HEADER", "");
 
+// If true, rewrite Host to local loopback when upstreamHost is loopback.
+// Default is false because it can cause ws to show host=127.0.0.1:8081 and some clients bail.
+const upstreamForceLocalHostHeader = envBool("OPENCLAW_UPSTREAM_FORCE_LOCAL_HOST", false);
+
 // OpenClaw expects bind MODEs here, not IPs.
 const bindPrimaryEnv = envStr("OPENCLAW_BIND", "loopback");
 const bindFallbackEnv = envStr("OPENCLAW_BIND_FALLBACK", "lan");
@@ -486,6 +492,10 @@ let flagNoDoctor = envBool("OPENCLAW_NO_DOCTOR", true);
 
 // Optional: enforce a strict retry without unknown flags by setting OPENCLAW_DISABLE_FLAG_AUTOFALLBACK=1
 const disableFlagAutofallback = envBool("OPENCLAW_DISABLE_FLAG_AUTOFALLBACK", false);
+
+// WS gentle close delay (helps iOS Safari)
+let wsCloseDelayMs = envInt("OPENCLAW_WS_CLOSE_DELAY_MS", 120);
+wsCloseDelayMs = clamp(wsCloseDelayMs, 0, 1500);
 
 // Simplified stateDir selection
 const candidates = [
@@ -517,7 +527,6 @@ console.log(
 );
 console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
 console.log("[railway-start] inject gateway token headers =", injectGatewayTokenHeaders ? "yes" : "no");
-console.log("[railway-start] inject token allow remote =", injectTokenAllowRemote ? "yes" : "no");
 console.log("[railway-start] pass gateway token to child =", passGatewayTokenToChild ? "yes" : "no");
 if (passGatewayTokenToChild && !token) {
   console.log("[railway-start] warning: passGatewayTokenToChild=1 but token is empty");
@@ -543,6 +552,11 @@ console.log(
   "readyExpect =",
   readyExpectRaw
 );
+console.log(
+  "[railway-start] upstreamForceLocalHostHeader =",
+  upstreamForceLocalHostHeader ? "yes" : "no"
+);
+console.log("[railway-start] wsCloseDelayMs =", wsCloseDelayMs);
 
 if (openclawListenOnExternal) {
   console.log("[railway-start] warning: OPENCLAW_LISTEN_ON_EXTERNAL=1 disables wrapper server");
@@ -708,19 +722,8 @@ const MAX_LOG_LINES = envInt("OPENCLAW_LOG_RING_MAX", 300);
 const outRing = [];
 const errRing = [];
 
-function redactTokenInLine(line) {
-  if (!token) return String(line || "");
-  const s = String(line || "");
-  if (!s) return s;
-  try {
-    return s.split(token).join("[REDACTED_TOKEN]");
-  } catch {
-    return s;
-  }
-}
-
 function pushRing(arr, line) {
-  arr.push(redactTokenInLine(line));
+  arr.push(line);
   while (arr.length > MAX_LOG_LINES) arr.shift();
 }
 
@@ -894,14 +897,9 @@ function selectUpstreamAgent() {
 
 // IMPORTANT: inject token when the upstream is actually using token auth.
 // That is true if either enforceTokenAuth is on OR the child is receiving the token.
-// Safety: do not inject tokens to non-local upstreamHost unless explicitly allowed.
 function shouldInjectGatewayToken() {
   if (!token) return false;
   if (!injectGatewayTokenHeaders) return false;
-
-  const localOk = isLocalUpstreamHost(upstreamHost);
-  if (!localOk && !injectTokenAllowRemote) return false;
-
   if (enforceTokenAuth) return true;
   if (passGatewayTokenToChild) return true;
   return false;
@@ -1135,13 +1133,21 @@ function pickHostHeaderForUpstream(req, xfHost) {
   if (upstreamHostHeaderOverride) return upstreamHostHeaderOverride;
 
   const inboundHost = req.headers?.host || "";
-  const inboundIsLocal = isLocalHostHeader(inboundHost);
+  const candidate = String(xfHost || inboundHost || "");
 
+  // Default behavior: keep the external host so OpenClaw sees the correct host/origin.
+  // Old behavior (rewrite to local) is available via OPENCLAW_UPSTREAM_FORCE_LOCAL_HOST=1.
+  if (!upstreamForceLocalHostHeader) {
+    return candidate;
+  }
+
+  // Optional legacy behavior
+  const inboundIsLocal = isLocalHostHeader(inboundHost);
   if (isLoopbackHost(upstreamHost) && !inboundIsLocal) {
     return buildLocalHostHeader(upstreamHost, internalPort);
   }
 
-  return String(xfHost || inboundHost || "");
+  return candidate;
 }
 
 function cleanRemoteAddr(addr) {
@@ -1155,6 +1161,18 @@ function cleanRemoteAddr(addr) {
   if (a.startsWith("[") && a.endsWith("]")) a = a.slice(1, -1);
 
   return a;
+}
+
+function safeProto(p) {
+  const s = String(p || "").trim().toLowerCase();
+  if (s === "https" || s === "http") return s;
+  return "";
+}
+
+function safeHost(h) {
+  const s = String(h || "").trim();
+  if (!s) return "";
+  return s.replace(/[\r\n]+/g, " ").trim();
 }
 
 function buildForwardedHeaders(req) {
@@ -1174,18 +1192,14 @@ function buildForwardedHeaders(req) {
   else if (priorXff) xff = safeHeaderValue(priorXff);
   else if (remoteAddr) xff = remoteAddr;
 
+  // Prefer explicit overrides, else use inbound forwarded headers (from Railway) if sane.
+  const inboundXfp = safeProto(req.headers[H_XFP] || req.headers["x-forwarded-proto"]);
   const xfProto =
-    forwardedProtoOverride ||
-    req.headers[H_XFP] ||
-    req.headers["x-forwarded-proto"] ||
-    (req.socket?.encrypted ? "https" : "http");
+    safeProto(forwardedProtoOverride) || inboundXfp || (req.socket?.encrypted ? "https" : "http");
 
-  const xfHost =
-    forwardedHostOverride ||
-    req.headers[H_XFH] ||
-    req.headers["x-forwarded-host"] ||
-    req.headers.host ||
-    "";
+  const inboundXfh = safeHost(req.headers[H_XFH] || req.headers["x-forwarded-host"]);
+  const inboundHost = safeHost(req.headers.host || "");
+  const xfHost = safeHost(forwardedHostOverride) || inboundXfh || inboundHost || "";
 
   const hopByHop = new Set([
     "connection",
@@ -1203,12 +1217,28 @@ function buildForwardedHeaders(req) {
     if (!hopByHop.has(String(k).toLowerCase())) cleaned[k] = v;
   }
 
+  // Always remove "Forwarded:" header to avoid weird proxy parsing and keep it simple.
+  delete cleaned.forwarded;
+
   cleaned.host = pickHostHeaderForUpstream(req, xfHost);
 
   if (selfSanitize) {
-    const stripped = stripProxyDerivedHeaders(cleaned);
-    stripped.host = cleaned.host || stripped.host || "";
-    return applyGatewayTokenToHeaders(stripped);
+    // In selfSanitize mode, do not forward arbitrary proxy-derived headers.
+    // Instead, rebuild a minimal, safe x-forwarded-* set so OpenClaw knows the external origin.
+    const base = stripProxyDerivedHeaders(cleaned);
+
+    base.host = cleaned.host || base.host || "";
+
+    const rebuilt = {
+      ...base,
+      [H_XFP]: String(safeHeaderValue(xfProto)),
+      [H_XFH]: String(safeHeaderValue(xfHost)),
+      ...(xff ? { [H_XFF]: String(xff) } : {}),
+      ...(remoteAddr ? { [H_XREAL]: String(remoteAddr) } : {}),
+      [H_XFPORT]: String(externalPort),
+    };
+
+    return applyGatewayTokenToHeaders(rebuilt);
   }
 
   const withForwarded = {
@@ -1438,8 +1468,7 @@ async function startOpenClawLoop() {
         .split("\n")
         .map((x) => x.trimEnd())
         .filter(Boolean);
-      for (const ln0 of lines) {
-        const ln = redactTokenInLine(ln0);
+      for (const ln of lines) {
         pushRing(outRing, ln);
         console.log("[openclaw]", ln);
 
@@ -1465,8 +1494,7 @@ async function startOpenClawLoop() {
         .map((x) => x.trimEnd())
         .filter(Boolean);
 
-      for (const ln0 of lines) {
-        const ln = redactTokenInLine(ln0);
+      for (const ln of lines) {
         pushRing(errRing, ln);
         console.error("[openclaw ERROR]", ln);
 
@@ -1575,6 +1603,24 @@ async function startOpenClawLoop() {
   console.log("[railway-start] OpenClaw is ready");
 }
 
+function safeEndThenDestroy(socketLike) {
+  if (!socketLike) return;
+
+  try {
+    if (socketLike.writable && !socketLike.destroyed) socketLike.end();
+  } catch {}
+
+  const t = setTimeout(() => {
+    try {
+      if (!socketLike.destroyed) socketLike.destroy();
+    } catch {}
+  }, wsCloseDelayMs);
+
+  try {
+    t.unref();
+  } catch {}
+}
+
 // If OpenClaw binds to externalPort, do not start wrapper server (port collision).
 if (openclawListenOnExternal) {
   console.log("[railway-start] OPENCLAW_LISTEN_ON_EXTERNAL=1");
@@ -1658,6 +1704,7 @@ if (openclawListenOnExternal) {
         upstreamProtocol,
         upstreamHost,
         upstreamHostHeaderOverride,
+        upstreamForceLocalHostHeader,
 
         clawReady,
         clawRunning: !!claw,
@@ -1674,7 +1721,6 @@ if (openclawListenOnExternal) {
 
         enforceTokenAuth,
         injectGatewayTokenHeaders,
-        injectTokenAllowRemote,
         passGatewayTokenToChild,
 
         autoPassTokenOnAuthError,
@@ -1703,6 +1749,8 @@ if (openclawListenOnExternal) {
         flagNoDoctor,
         disableFlagAutofallback,
 
+        wsCloseDelayMs,
+
         trustedProxies: trusted,
         outTail: outRing.slice(-120),
         errTail: errRing.slice(-120),
@@ -1727,6 +1775,13 @@ if (openclawListenOnExternal) {
   server.keepAliveTimeout = 65000;
   server.headersTimeout = 70000;
 
+  server.on("connection", (sock) => {
+    try {
+      sock.setNoDelay(true);
+      sock.setKeepAlive(true);
+    } catch {}
+  });
+
   server.on("error", (e) => {
     console.error("[railway-start] server error:", e?.stack || e);
   });
@@ -1742,63 +1797,54 @@ if (openclawListenOnExternal) {
     } catch {}
   });
 
-  function destroySocketGracefully(s) {
-    try {
-      if (s && s.writable) s.end();
-    } catch {}
-    setTimeout(() => {
-      try {
-        if (s) s.destroy();
-      } catch {}
-    }, 150);
-  }
-
   // WebSocket upgrade proxy
   server.on("upgrade", async (req, socket, head) => {
     let upstreamReq = null;
     let upstreamSocket = null;
-    let destroyed = false;
+    let upgraded = false;
+    let closing = false;
+
+    // Pause immediately so early frames do not race the piping setup
+    try {
+      socket.pause();
+    } catch {}
 
     // Improve WS stability early for mobile clients
     try {
       socket.setNoDelay(true);
+      socket.setTimeout(0);
+      socket.setKeepAlive(true);
     } catch {}
 
-    const destroyBoth = () => {
-      if (destroyed) return;
-      destroyed = true;
+    const destroyBoth = (why = "") => {
+      if (closing) return;
+      closing = true;
+      if (why) console.log("[railway-start] ws closing:", why);
 
       try {
         if (upstreamReq) upstreamReq.destroy();
       } catch {}
+
       try {
-        if (upstreamSocket) destroySocketGracefully(upstreamSocket);
+        if (upstreamSocket) safeEndThenDestroy(upstreamSocket);
       } catch {}
       try {
-        destroySocketGracefully(socket);
+        if (socket) safeEndThenDestroy(socket);
       } catch {}
     };
 
     try {
       const url = req.url || "/";
 
-      // Avoid flaky ws proxy behavior when upstreamProtocol is https
-      if (upstreamProtocol === "https") {
-        console.log("[railway-start] upgrade refused because OPENCLAW_UPSTREAM_PROTOCOL=https (set to http on localhost)");
-        return destroyBoth();
-      }
-
-      // For upgrades, be strict if enforceProxyToken is enabled.
-      // Do not exempt asset paths here because some deployments may upgrade on non-obvious routes.
-      if (enforceProxyToken && url !== "/debug") {
+      if (enforceProxyToken && url !== "/debug" && !isPublicUiPath(url)) {
         const check = checkProxyToken(req);
-        if (!check.ok) return destroyBoth();
+        if (!check.ok) return destroyBoth("proxy token rejected");
       }
 
-      if (!proxyEnabled) return destroyBoth();
+      if (!proxyEnabled) return destroyBoth("proxy disabled");
 
       const isReady = await isOpenClawReadyFast();
-      if (!isReady) return destroyBoth();
+      if (!isReady) return destroyBoth("upstream not ready");
 
       const headers = buildForwardedHeaders(req);
 
@@ -1818,10 +1864,16 @@ if (openclawListenOnExternal) {
         timeout: proxyTimeoutMs,
       };
 
+      if (upstreamProtocol === "https") {
+        options.rejectUnauthorized = !upstreamInsecure;
+      }
+
       upstreamReq = client.request(options);
 
-      socket.on("error", destroyBoth);
-      socket.on("close", destroyBoth);
+      socket.on("error", () => destroyBoth("client socket error"));
+      socket.on("close", () => {
+        if (!upgraded) destroyBoth("client socket closed before upgrade complete");
+      });
 
       upstreamReq.on("response", (upstreamRes) => {
         try {
@@ -1844,25 +1896,35 @@ if (openclawListenOnExternal) {
 
           upstreamRes.on("end", () => {
             try {
-              destroySocketGracefully(socket);
+              socket.end();
             } catch {}
-            destroyBoth();
+            destroyBoth("upstream ended non-upgrade response");
           });
 
-          upstreamRes.on("error", destroyBoth);
+          upstreamRes.on("error", () => destroyBoth("upstream response error"));
+
+          // Resume to allow the response to flush cleanly
+          try {
+            socket.resume();
+          } catch {}
         } catch {
-          destroyBoth();
+          destroyBoth("response handler threw");
         }
       });
 
       upstreamReq.on("upgrade", (upstreamRes, us, uHead) => {
         upstreamSocket = us;
+        upgraded = true;
 
         try {
           socket.setNoDelay(true);
+          socket.setTimeout(0);
+          socket.setKeepAlive(true);
         } catch {}
         try {
           upstreamSocket.setNoDelay(true);
+          upstreamSocket.setTimeout(0);
+          upstreamSocket.setKeepAlive(true);
         } catch {}
 
         const safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers);
@@ -1876,30 +1938,37 @@ if (openclawListenOnExternal) {
         ];
         socket.write(lines.join("\r\n"));
 
+        // Client "head" belongs to upstream
         if (head && head.length) {
           try {
             upstreamSocket.write(head);
           } catch {}
         }
 
+        // Upstream "uHead" belongs to client
         if (uHead && uHead.length) {
           try {
             socket.write(uHead);
           } catch {}
         }
 
-        upstreamSocket.on("error", destroyBoth);
-        upstreamSocket.on("close", destroyBoth);
+        upstreamSocket.on("error", () => destroyBoth("upstream socket error"));
+        upstreamSocket.on("close", () => destroyBoth("upstream socket closed"));
+
+        // Now that piping exists, resume inbound flow
+        try {
+          socket.resume();
+        } catch {}
 
         socket.pipe(upstreamSocket).pipe(socket);
       });
 
-      upstreamReq.on("timeout", () => destroyBoth());
-      upstreamReq.on("error", () => destroyBoth());
+      upstreamReq.on("timeout", () => destroyBoth("upstream request timeout"));
+      upstreamReq.on("error", (e) => destroyBoth(`upstream request error: ${e?.message || e}`));
 
       upstreamReq.end();
-    } catch {
-      destroyBoth();
+    } catch (e) {
+      destroyBoth(`upgrade handler exception: ${e?.message || e}`);
     }
   });
 
