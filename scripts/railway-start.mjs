@@ -24,10 +24,10 @@
 // Updates in this version
 // - Readiness supports HTTP and TCP, with HTTP fallbacks to reduce false negatives.
 //   Controls:
-//   - OPENCLAW_READY_CHECK_MODE = “http” | “tcp” (default “http”)
-//   - OPENCLAW_READY_PATH = “/health” (default “/health”)
-//   - OPENCLAW_READY_FALLBACK_PATHS = “/,/ready” (default “/,/ready”)
-//   - OPENCLAW_READY_EXPECT = “200” | “2xx” | “any” | “200,204” (default “200”)
+//   - OPENCLAW_READY_CHECK_MODE = "http" | "tcp" (default "http")
+//   - OPENCLAW_READY_PATH = "/health" (default "/health")
+//   - OPENCLAW_READY_FALLBACK_PATHS = "/,/ready" (default "/,/ready")
+//   - OPENCLAW_READY_EXPECT = "200" | "2xx" | "any" | "200,204" (default "200")
 //   - OPENCLAW_READY_TIMEOUT_MS = 1200 (default 1200)
 // - Watchdog uses the same readiness check for better signal.
 // - Do NOT write gateway.auth unless token auth is explicitly enabled.
@@ -40,7 +40,7 @@
 // Fixes in this update (based on your logs)
 // - Ensures the child receives the token when needed:
 //   - passGatewayTokenToChild is mutable (let), so we can auto-heal.
-//   - When passing token to child, we also pass CLI args: –token <token>.
+//   - When passing token to child, we also pass CLI args: --token <token>.
 //   - Auto-heal: if OpenClaw logs “Gateway auth is set to token, but no token is configured”,
 //     we flip passGatewayTokenToChild to true for the next restart.
 //   - Control auto-heal with OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR=0 to disable.
@@ -50,561 +50,560 @@
 // - This wrapper injects the gateway token into upstream HTTP and WS requests so the UI works.
 //   Control with OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS=0 to disable.
 
-import fs from “node:fs”;
-import path from “node:path”;
-import http from “node:http”;
-import https from “node:https”;
-import net from “node:net”;
-import crypto from “node:crypto”;
-import { spawn, spawnSync } from “node:child_process”;
+import fs from "node:fs";
+import path from "node:path";
+import http from "node:http";
+import https from "node:https";
+import net from "node:net";
+import crypto from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
 
-console.log(”[railway-start] starting”);
+console.log("[railway-start] starting");
 
 function uniq(arr) {
-return Array.from(new Set((arr || []).filter(Boolean)));
+  return Array.from(new Set((arr || []).filter(Boolean)));
 }
 
 function envBool(name, defaultValue = false) {
-const v = String(process.env[name] || “”).trim().toLowerCase();
-if (!v) return defaultValue;
-return v === “1” || v === “true” || v === “yes” || v === “on”;
+  const v = String(process.env[name] || "").trim().toLowerCase();
+  if (!v) return defaultValue;
+  return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
 function envInt(name, fallback) {
-const raw = String(process.env[name] ?? “”).trim();
-if (raw.length === 0) return fallback;
-const n = Number(raw);
-return Number.isFinite(n) ? n : fallback;
+  const raw = String(process.env[name] ?? "").trim();
+  if (raw.length === 0) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-function envStr(name, fallback = “”) {
-const v = String(process.env[name] || “”).trim();
-return v || fallback;
+function envStr(name, fallback = "") {
+  const v = String(process.env[name] || "").trim();
+  return v || fallback;
 }
 
 function readJsonIfExists(p) {
-try {
-if (!fs.existsSync(p)) return null;
-return JSON.parse(fs.readFileSync(p, “utf8”));
-} catch (e) {
-console.log(`[railway-start] could not read ${p}: ${e?.message || e}`);
-return null;
-}
+  try {
+    if (!fs.existsSync(p)) return null;
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch (e) {
+    console.log(`[railway-start] could not read ${p}: ${e?.message || e}`);
+    return null;
+  }
 }
 
 function safeMkdir(dir) {
-try {
-fs.mkdirSync(dir, { recursive: true });
-return true;
-} catch (e) {
-console.log(`[railway-start] mkdir failed ${dir}: ${e?.message || e}`);
-return false;
-}
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    return true;
+  } catch (e) {
+    console.log(`[railway-start] mkdir failed ${dir}: ${e?.message || e}`);
+    return false;
+  }
 }
 
 function safeWriteJson(p, obj) {
-try {
-fs.writeFileSync(p, JSON.stringify(obj, null, 2), “utf8”);
-console.log(`[railway-start] wrote ${p}`);
-return true;
-} catch (e) {
-console.log(`[railway-start] write failed ${p}: ${e?.message || e}`);
-return false;
-}
+  try {
+    fs.writeFileSync(p, JSON.stringify(obj, null, 2), "utf8");
+    console.log(`[railway-start] wrote ${p}`);
+    return true;
+  } catch (e) {
+    console.log(`[railway-start] write failed ${p}: ${e?.message || e}`);
+    return false;
+  }
 }
 
 function safeWriteText(p, text) {
-try {
-fs.writeFileSync(p, String(text ?? “”), “utf8”);
-console.log(`[railway-start] wrote ${p}`);
-return true;
-} catch (e) {
-console.log(`[railway-start] write failed ${p}: ${e?.message || e}`);
-return false;
-}
+  try {
+    fs.writeFileSync(p, String(text ?? ""), "utf8");
+    console.log(`[railway-start] wrote ${p}`);
+    return true;
+  } catch (e) {
+    console.log(`[railway-start] write failed ${p}: ${e?.message || e}`);
+    return false;
+  }
 }
 
 function canWriteDir(dir) {
-try {
-safeMkdir(dir);
-const test = path.join(dir, `.write-test-${Date.now()}.tmp`);
-fs.writeFileSync(test, “ok”, “utf8”);
-fs.unlinkSync(test);
-return true;
-} catch {
-return false;
-}
+  try {
+    safeMkdir(dir);
+    const test = path.join(dir, `.write-test-${Date.now()}.tmp`);
+    fs.writeFileSync(test, "ok", "utf8");
+    fs.unlinkSync(test);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function parseTrustedProxies() {
-const override = String(process.env.OPENCLAW_TRUSTED_PROXIES || “”).trim();
-const base = [
-“100.64.0.0/10”,
-“10.0.0.0/8”,
-“172.16.0.0/12”,
-“192.168.0.0/16”,
-“127.0.0.1/32”,
-“::1/128”,
-];
-const extra = override
-? override
-.split(”,”)
-.map((s) => s.trim())
-.filter(Boolean)
-: [];
-return uniq([…base, …extra]);
+  const override = String(process.env.OPENCLAW_TRUSTED_PROXIES || "").trim();
+  const base = [
+    "100.64.0.0/10",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "127.0.0.1/32",
+    "::1/128",
+  ];
+  const extra = override
+    ? override
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  return uniq([...base, ...extra]);
 }
 
 function tcpCheck(host, port, timeoutMs = 800) {
-return new Promise((resolve) => {
-const sock = net.connect({ host, port });
-const done = (ok) => {
-try {
-sock.destroy();
-} catch {}
-resolve(ok);
-};
-sock.setTimeout(timeoutMs);
-sock.on(“connect”, () => done(true));
-sock.on(“timeout”, () => done(false));
-sock.on(“error”, () => done(false));
-});
+  return new Promise((resolve) => {
+    const sock = net.connect({ host, port });
+    const done = (ok) => {
+      try {
+        sock.destroy();
+      } catch {}
+      resolve(ok);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.on("connect", () => done(true));
+    sock.on("timeout", () => done(false));
+    sock.on("error", () => done(false));
+  });
 }
 
 function clamp(n, min, max) {
-return Math.max(min, Math.min(max, n));
+  return Math.max(min, Math.min(max, n));
 }
 
 function sleep(ms) {
-return new Promise((r) => setTimeout(r, ms));
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function hasWorkingLsof() {
-try {
-const res = spawnSync(“lsof”, [”-v”], { stdio: “ignore” });
-if (res.error) return false;
-return res.status === 0 || res.status === 1;
-} catch {
-return false;
-}
+  try {
+    const res = spawnSync("lsof", ["-v"], { stdio: "ignore" });
+    if (res.error) return false;
+    return res.status === 0 || res.status === 1;
+  } catch {
+    return false;
+  }
 }
 
 function parseHostOnly(hostHeader) {
-const raw = String(hostHeader || “”).trim();
-if (!raw) return “”;
-if (raw.startsWith(”[”)) {
-const end = raw.indexOf(”]”);
-if (end > 0) return raw.slice(0, end + 1).toLowerCase();
-return raw.toLowerCase();
-}
-const idx = raw.indexOf(”:”);
-if (idx >= 0) return raw.slice(0, idx).toLowerCase();
-return raw.toLowerCase();
+  const raw = String(hostHeader || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("[")) {
+    const end = raw.indexOf("]");
+    if (end > 0) return raw.slice(0, end + 1).toLowerCase();
+    return raw.toLowerCase();
+  }
+  const idx = raw.indexOf(":");
+  if (idx >= 0) return raw.slice(0, idx).toLowerCase();
+  return raw.toLowerCase();
 }
 
 function isLoopbackHost(h) {
-const s = String(h || “”).trim().toLowerCase();
-if (!s) return false;
-if (s === “127.0.0.1”) return true;
-if (s === “localhost”) return true;
-if (s === “::1”) return true;
-return false;
+  const s = String(h || "").trim().toLowerCase();
+  if (!s) return false;
+  if (s === "127.0.0.1") return true;
+  if (s === "localhost") return true;
+  if (s === "::1") return true;
+  return false;
 }
 
 function isLocalHostHeader(hostHeader) {
-const hostOnly = parseHostOnly(hostHeader);
-return (
-hostOnly === “127.0.0.1” ||
-hostOnly === “localhost” ||
-hostOnly === “[::1]” ||
-hostOnly === “::1”
-);
+  const hostOnly = parseHostOnly(hostHeader);
+  return (
+    hostOnly === "127.0.0.1" ||
+    hostOnly === "localhost" ||
+    hostOnly === "[::1]" ||
+    hostOnly === "::1"
+  );
 }
 
 // IPv6-safe local Host header builder
 function buildLocalHostHeader(hostForUpstream, portForUpstream) {
-const hh = String(hostForUpstream || “”).trim();
-if (!hh) return `127.0.0.1:${portForUpstream}`;
+  const hh = String(hostForUpstream || "").trim();
+  if (!hh) return `127.0.0.1:${portForUpstream}`;
 
-if (hh.startsWith(”[”) && hh.includes(”]”)) return `${hh}:${portForUpstream}`;
+  if (hh.startsWith("[") && hh.includes("]")) return `${hh}:${portForUpstream}`;
 
-if (hh.includes(”:”) && !hh.includes(”.”)) return `[${hh}]:${portForUpstream}`;
+  if (hh.includes(":") && !hh.includes(".")) return `[${hh}]:${portForUpstream}`;
 
-if (hh.includes(”:”)) return hh;
+  if (hh.includes(":")) return hh;
 
-return `${hh}:${portForUpstream}`;
+  return `${hh}:${portForUpstream}`;
 }
 
 // Basic shell-style split with quotes, for OPENCLAW_CMD only.
 // Supports: spaces, single quotes, double quotes, backslash escapes inside double quotes.
 function shellSplit(cmdline) {
-const s = String(cmdline || “”).trim();
-if (!s) return [];
-const out = [];
-let cur = “”;
-let q = null; // “’” | ‘”’ | null
-let esc = false;
+  const s = String(cmdline || "").trim();
+  if (!s) return [];
+  const out = [];
+  let cur = "";
+  let q = null; // "'" | '"' | null
+  let esc = false;
 
-for (let i = 0; i < s.length; i++) {
-const ch = s[i];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
 
-```
-if (esc) {
-  cur += ch;
-  esc = false;
-  continue;
-}
+    if (esc) {
+      cur += ch;
+      esc = false;
+      continue;
+    }
 
-if (q === '"') {
-  if (ch === "\\") {
-    esc = true;
-    continue;
+    if (q === '"') {
+      if (ch === "\\") {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') {
+        q = null;
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+
+    if (q === "'") {
+      if (ch === "'") {
+        q = null;
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      q = ch;
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      if (cur.length) out.push(cur), (cur = "");
+      continue;
+    }
+
+    cur += ch;
   }
-  if (ch === '"') {
-    q = null;
-    continue;
-  }
-  cur += ch;
-  continue;
-}
 
-if (q === "'") {
-  if (ch === "'") {
-    q = null;
-    continue;
-  }
-  cur += ch;
-  continue;
-}
+  if (cur.length) out.push(cur);
 
-if (ch === '"' || ch === "'") {
-  q = ch;
-  continue;
-}
-
-if (/\s/.test(ch)) {
-  if (cur.length) out.push(cur), (cur = "");
-  continue;
-}
-
-cur += ch;
-```
-
-}
-
-if (cur.length) out.push(cur);
-
-return out;
+  return out;
 }
 
 function shQuoteArg(a) {
-const s = String(a ?? “”);
-if (s.length === 0) return “’’”;
-if (/^[A-Za-z0-9_./:@-]+$/.test(s)) return s;
-return “’” + s.replace(/’/g, “’\’’”) + “’”;
+  const s = String(a ?? "");
+  if (s.length === 0) return "''";
+  if (/^[A-Za-z0-9_./:@-]+$/.test(s)) return s;
+  return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
 function shJoin(cmd, args) {
-return [cmd, …(args || [])].map(shQuoteArg).join(” “);
+  return [cmd, ...(args || [])].map(shQuoteArg).join(" ");
 }
 
 function headerValueToString(v) {
-if (Array.isArray(v)) return v.map((x) => String(x)).join(”, “);
-if (v == null) return “”;
-return String(v);
+  if (Array.isArray(v)) return v.map((x) => String(x)).join(", ");
+  if (v == null) return "";
+  return String(v);
 }
 
 function headersToLines(headers) {
-const out = [];
-for (const [k, v] of Object.entries(headers || {})) {
-const sv = headerValueToString(v);
-if (!sv) continue;
-out.push(`${k}: ${sv}`);
-}
-return out;
+  const out = [];
+  for (const [k, v] of Object.entries(headers || {})) {
+    const sv = headerValueToString(v);
+    if (!sv) continue;
+    out.push(`${k}: ${sv}`);
+  }
+  return out;
 }
 
 function tokenFingerprint(tok) {
-const t = String(tok || “”);
-if (!t) return { present: false, len: 0, sha256_8: “” };
-const hex = crypto.createHash(“sha256”).update(t).digest(“hex”);
-return { present: true, len: t.length, sha256_8: hex.slice(0, 8) };
+  const t = String(tok || "");
+  if (!t) return { present: false, len: 0, sha256_8: "" };
+  const hex = crypto.createHash("sha256").update(t).digest("hex");
+  return { present: true, len: t.length, sha256_8: hex.slice(0, 8) };
 }
 
 function parseReadyExpect(expectRaw) {
-const raw = String(expectRaw || “”).trim().toLowerCase();
-if (!raw) return { mode: “exact”, exact: new Set([“200”]) };
-if (raw === “2xx”) return { mode: “2xx” };
-if (raw === “any”) return { mode: “any” };
+  const raw = String(expectRaw || "").trim().toLowerCase();
+  if (!raw) return { mode: "exact", exact: new Set(["200"]) };
+  if (raw === "2xx") return { mode: "2xx" };
+  if (raw === "any") return { mode: "any" };
 
-const parts = raw
-.split(”,”)
-.map((x) => x.trim())
-.filter(Boolean);
+  const parts = raw
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
 
-if (parts.length === 0) return { mode: “exact”, exact: new Set([“200”]) };
-return { mode: “exact”, exact: new Set(parts) };
+  if (parts.length === 0) return { mode: "exact", exact: new Set(["200"]) };
+  return { mode: "exact", exact: new Set(parts) };
 }
 
 function parseReadyFallbackPaths(raw) {
-const s = String(raw || “”).trim();
-if (!s) return [”/”, “/ready”];
-const parts = s
-.split(”,”)
-.map((x) => x.trim())
-.filter(Boolean)
-.map((p) => (p.startsWith(”/”) ? p : `/${p}`));
-return parts.length ? parts : [”/”, “/ready”];
+  const s = String(raw || "").trim();
+  if (!s) return ["/", "/ready"];
+  const parts = s
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((p) => (p.startsWith("/") ? p : `/${p}`));
+  return parts.length ? parts : ["/", "/ready"];
 }
 
 function matchesReadyExpect(statusCode, expectSpec) {
-const code = Number(statusCode);
-if (!Number.isFinite(code)) return false;
+  const code = Number(statusCode);
+  if (!Number.isFinite(code)) return false;
 
-if (expectSpec.mode === “2xx”) return code >= 200 && code <= 299;
+  if (expectSpec.mode === "2xx") return code >= 200 && code <= 299;
 
-if (expectSpec.mode === “any”) {
-return code >= 200 && code <= 499;
-}
+  if (expectSpec.mode === "any") {
+    return code >= 200 && code <= 499;
+  }
 
-const str = String(code);
-return expectSpec.exact?.has(str) || false;
+  const str = String(code);
+  return expectSpec.exact?.has(str) || false;
 }
 
 // Railway port (public)
-const externalPort = envInt(“PORT”, 8080);
+const externalPort = envInt("PORT", 8080);
 
 // Internal port for OpenClaw when proxying (default)
-const internalPortDefault = envInt(“OPENCLAW_INTERNAL_PORT”, 8081);
+const internalPortDefault = envInt("OPENCLAW_INTERNAL_PORT", 8081);
 
 // If OPENCLAW_LISTEN_ON_EXTERNAL=1, OpenClaw binds to externalPort.
 // In that mode this wrapper MUST NOT bind to externalPort.
-const openclawListenOnExternal = envBool(“OPENCLAW_LISTEN_ON_EXTERNAL”, false);
+const openclawListenOnExternal = envBool("OPENCLAW_LISTEN_ON_EXTERNAL", false);
 
 const internalPort = openclawListenOnExternal ? externalPort : internalPortDefault;
 
-const token = envStr(“OPENCLAW_GATEWAY_TOKEN”, “”);
-const enforceTokenAuth = envBool(“OPENCLAW_ENFORCE_TOKEN_AUTH”, false);
+const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
+const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
 // Inject gateway token into upstream requests (fixes token_mismatch for Control UI)
-const injectGatewayTokenHeaders = envBool(“OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS”, true);
+const injectGatewayTokenHeaders = envBool("OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS", true);
 
 // Auto-heal when OpenClaw complains auth token missing
-const autoPassTokenOnAuthError = envBool(“OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR”, true);
+const autoPassTokenOnAuthError = envBool("OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR", true);
 
 // If token auth is not enforced, default to NOT passing OPENCLAW_GATEWAY_TOKEN into the child.
 let passGatewayTokenToChild =
-enforceTokenAuth || envBool(“OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD”, false);
+  enforceTokenAuth || envBool("OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD", false);
 
 // Self sanitize config to a strict minimal object that cannot contain unknown keys.
-const selfSanitize = envBool(“OPENCLAW_SELF_SANITIZE”, true);
+const selfSanitize = envBool("OPENCLAW_SELF_SANITIZE", true);
 
-let startupTimeoutMs = envInt(“OPENCLAW_STARTUP_TIMEOUT_MS”, 120000);
+let startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 120000);
 startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
 
-const watchdogIntervalMs = envInt(“OPENCLAW_WATCHDOG_INTERVAL_MS”, 8000);
-const proxyTimeoutMs = envInt(“OPENCLAW_PROXY_TIMEOUT_MS”, 60000);
+const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
+const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
 
 // Readiness checks
 const readyCheckMode =
-envStr(“OPENCLAW_READY_CHECK_MODE”, “http”).toLowerCase() === “tcp” ? “tcp” : “http”;
-const readyPath = envStr(“OPENCLAW_READY_PATH”, “/health”) || “/health”;
-const readyFallbackPaths = parseReadyFallbackPaths(envStr(“OPENCLAW_READY_FALLBACK_PATHS”, “/,/ready”));
-const readyExpectRaw = String(envStr(“OPENCLAW_READY_EXPECT”, “200”)).trim() || “200”;
+  envStr("OPENCLAW_READY_CHECK_MODE", "http").toLowerCase() === "tcp" ? "tcp" : "http";
+const readyPath = envStr("OPENCLAW_READY_PATH", "/health") || "/health";
+const readyFallbackPaths = parseReadyFallbackPaths(
+  envStr("OPENCLAW_READY_FALLBACK_PATHS", "/,/ready")
+);
+const readyExpectRaw = String(envStr("OPENCLAW_READY_EXPECT", "200")).trim() || "200";
 const readyExpectSpec = parseReadyExpect(readyExpectRaw);
 
-let readyTimeoutMs = envInt(“OPENCLAW_READY_TIMEOUT_MS”, 1200);
+let readyTimeoutMs = envInt("OPENCLAW_READY_TIMEOUT_MS", 1200);
 readyTimeoutMs = clamp(readyTimeoutMs, 250, 8000);
 
 // Upstream protocol for proxy mode
 const upstreamProtocol =
-envStr(“OPENCLAW_UPSTREAM_PROTOCOL”, “http”).toLowerCase() === “https” ? “https” : “http”;
-const upstreamHost = envStr(“OPENCLAW_UPSTREAM_HOST”, “127.0.0.1”);
+  envStr("OPENCLAW_UPSTREAM_PROTOCOL", "http").toLowerCase() === "https" ? "https" : "http";
+const upstreamHost = envStr("OPENCLAW_UPSTREAM_HOST", "127.0.0.1");
 
-// Hoist env bools that were previously read in hot paths (Fix #5)
-const upstreamInsecure = envBool(“OPENCLAW_UPSTREAM_INSECURE”, false);
+// Hoist env bools that were previously read in hot paths
+const upstreamInsecure = envBool("OPENCLAW_UPSTREAM_INSECURE", false);
 
 // Optional: override forwarded host/proto if you want hardcoding.
-const forwardedProtoOverride = envStr(“OPENCLAW_FORWARDED_PROTO”, “”);
-const forwardedHostOverride = envStr(“OPENCLAW_FORWARDED_HOST”, “”);
+const forwardedProtoOverride = envStr("OPENCLAW_FORWARDED_PROTO", "");
+const forwardedHostOverride = envStr("OPENCLAW_FORWARDED_HOST", "");
 
 // Optional: if set, force the Host header sent upstream (rare)
-const upstreamHostHeaderOverride = envStr(“OPENCLAW_UPSTREAM_HOST_HEADER”, “”);
+const upstreamHostHeaderOverride = envStr("OPENCLAW_UPSTREAM_HOST_HEADER", "");
 
 // OpenClaw expects bind MODEs here, not IPs.
-const bindPrimaryEnv = envStr(“OPENCLAW_BIND”, “loopback”);
-const bindFallbackEnv = envStr(“OPENCLAW_BIND_FALLBACK”, “lan”);
+const bindPrimaryEnv = envStr("OPENCLAW_BIND", "loopback");
+const bindFallbackEnv = envStr("OPENCLAW_BIND_FALLBACK", "lan");
 
 // If OpenClaw is the public listener, it cannot bind loopback on Railway
-const bindPrimary = openclawListenOnExternal ? “lan” : bindPrimaryEnv;
-const bindFallback = openclawListenOnExternal ? “lan” : bindFallbackEnv;
+const bindPrimary = openclawListenOnExternal ? "lan" : bindPrimaryEnv;
+const bindFallback = openclawListenOnExternal ? "lan" : bindFallbackEnv;
 
-const useShellForLocalBin = envBool(“OPENCLAW_SHELL_LOCAL_BIN”, true);
+const useShellForLocalBin = envBool("OPENCLAW_SHELL_LOCAL_BIN", true);
 
 // Optional: enforce a token on inbound requests to the wrapper proxy.
-const enforceProxyToken = envBool(“OPENCLAW_PROXY_ENFORCE_TOKEN”, false);
+const enforceProxyToken = envBool("OPENCLAW_PROXY_ENFORCE_TOKEN", false);
 
 // Proxy enabled by default, disabled automatically if OpenClaw is listening on external.
-const proxyEnabled = envBool(“OPENCLAW_PROXY_ENABLED”, !openclawListenOnExternal);
+const proxyEnabled = envBool("OPENCLAW_PROXY_ENABLED", !openclawListenOnExternal);
 
-// Use –force only if explicitly requested AND lsof exists.
-const forceRequested = envBool(“OPENCLAW_FORCE”, false);
+// Use --force only if explicitly requested AND lsof exists.
+const forceRequested = envBool("OPENCLAW_FORCE", false);
 const forceEnabled = forceRequested && hasWorkingLsof();
 
-// –no-doctor flag: bypass missing system utilities like lsof (Fix #8)
-const noDoctorEnabled = envBool(“OPENCLAW_NO_DOCTOR”, true);
+// --no-doctor flag: bypass missing system utilities like lsof
+const noDoctorEnabled = envBool("OPENCLAW_NO_DOCTOR", true);
 
-// Fix #2: Simplified stateDir selection – single iteration over candidates
+// Simplified stateDir selection
 const candidates = [
-process.env.OPENCLAW_STATE_DIR,
-“/data/.openclaw”,
-“/home/node/.openclaw”,
-“/tmp/.openclaw”,
+  process.env.OPENCLAW_STATE_DIR,
+  "/data/.openclaw",
+  "/home/node/.openclaw",
+  "/tmp/.openclaw",
 ].filter(Boolean);
 
-let stateDir = “/tmp/.openclaw”;
+let stateDir = "/tmp/.openclaw";
 for (const dir of candidates) {
-if (canWriteDir(dir)) {
-stateDir = dir;
-break;
-}
+  if (canWriteDir(dir)) {
+    stateDir = dir;
+    break;
+  }
 }
 
 const tokenFp = tokenFingerprint(token);
 
-console.log(”[railway-start] external PORT =”, externalPort);
-console.log(”[railway-start] internal OpenClaw port =”, internalPort);
-console.log(”[railway-start] proxyEnabled =”, proxyEnabled ? “yes” : “no”);
-console.log(”[railway-start] openclawListenOnExternal =”, openclawListenOnExternal ? “yes” : “no”);
-console.log(”[railway-start] chosen stateDir =”, stateDir);
-console.log(”[railway-start] token present =”, token ? “yes” : “no”);
+console.log("[railway-start] external PORT =", externalPort);
+console.log("[railway-start] internal OpenClaw port =", internalPort);
+console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
+console.log("[railway-start] openclawListenOnExternal =", openclawListenOnExternal ? "yes" : "no");
+console.log("[railway-start] chosen stateDir =", stateDir);
+console.log("[railway-start] token present =", token ? "yes" : "no");
 console.log(
-“[railway-start] token fingerprint =”,
-tokenFp.present ? `${tokenFp.sha256_8} (len ${tokenFp.len})` : “none”
+  "[railway-start] token fingerprint =",
+  tokenFp.present ? `${tokenFp.sha256_8} (len ${tokenFp.len})` : "none"
 );
-console.log(”[railway-start] enforce gateway token auth =”, enforceTokenAuth ? “yes” : “no”);
-console.log(”[railway-start] inject gateway token headers =”, injectGatewayTokenHeaders ? “yes” : “no”);
-console.log(”[railway-start] pass gateway token to child =”, passGatewayTokenToChild ? “yes” : “no”);
-console.log(”[railway-start] autoPassTokenOnAuthError =”, autoPassTokenOnAuthError ? “yes” : “no”);
-console.log(”[railway-start] enforce proxy token =”, enforceProxyToken ? “yes” : “no”);
-console.log(”[railway-start] selfSanitize =”, selfSanitize ? “yes” : “no”);
-console.log(”[railway-start] startupTimeoutMs =”, startupTimeoutMs);
-console.log(”[railway-start] bindPrimary =”, bindPrimary, “bindFallback =”, bindFallback);
-console.log(”[railway-start] OPENCLAW_SHELL_LOCAL_BIN =”, useShellForLocalBin ? “yes” : “no”);
-console.log(”[railway-start] OpenClaw force requested =”, forceRequested ? “yes” : “no”);
-console.log(”[railway-start] OpenClaw force enabled =”, forceEnabled ? “yes” : “no”);
-console.log(”[railway-start] OpenClaw –no-doctor =”, noDoctorEnabled ? “yes” : “no”);
-console.log(”[railway-start] upstream =”, `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
+console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
+console.log("[railway-start] inject gateway token headers =", injectGatewayTokenHeaders ? "yes" : "no");
+console.log("[railway-start] pass gateway token to child =", passGatewayTokenToChild ? "yes" : "no");
+console.log("[railway-start] autoPassTokenOnAuthError =", autoPassTokenOnAuthError ? "yes" : "no");
+console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" : "no");
+console.log("[railway-start] selfSanitize =", selfSanitize ? "yes" : "no");
+console.log("[railway-start] startupTimeoutMs =", startupTimeoutMs);
+console.log("[railway-start] bindPrimary =", bindPrimary, "bindFallback =", bindFallback);
+console.log("[railway-start] OPENCLAW_SHELL_LOCAL_BIN =", useShellForLocalBin ? "yes" : "no");
+console.log("[railway-start] OpenClaw force requested =", forceRequested ? "yes" : "no");
+console.log("[railway-start] OpenClaw force enabled =", forceEnabled ? "yes" : "no");
+console.log("[railway-start] OpenClaw --no-doctor =", noDoctorEnabled ? "yes" : "no");
+console.log("[railway-start] upstream =", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
 console.log(
-“[railway-start] readyCheckMode =”,
-readyCheckMode,
-“readyPath =”,
-readyPath,
-“readyFallbackPaths =”,
-readyFallbackPaths.join(”,”),
-“readyExpect =”,
-readyExpectRaw
+  "[railway-start] readyCheckMode =",
+  readyCheckMode,
+  "readyPath =",
+  readyPath,
+  "readyFallbackPaths =",
+  readyFallbackPaths.join(","),
+  "readyExpect =",
+  readyExpectRaw
 );
 
 if (openclawListenOnExternal) {
-console.log(”[railway-start] warning: OPENCLAW_LISTEN_ON_EXTERNAL=1 disables wrapper server”);
-console.log(”[railway-start] recommended default on Railway is proxy mode (OPENCLAW_LISTEN_ON_EXTERNAL=0)”);
+  console.log("[railway-start] warning: OPENCLAW_LISTEN_ON_EXTERNAL=1 disables wrapper server");
+  console.log("[railway-start] recommended default on Railway is proxy mode (OPENCLAW_LISTEN_ON_EXTERNAL=0)");
 }
 
 safeMkdir(stateDir);
 
-const configA = path.join(stateDir, “openclaw.json”);
-const configB = path.join(stateDir, “config.json”);
+const configA = path.join(stateDir, "openclaw.json");
+const configB = path.join(stateDir, "config.json");
 
 // Read existing config (if any) then sanitize.
 const existing = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
 const existingGateway =
-typeof existing?.gateway === “object” && existing.gateway ? existing.gateway : {};
+  typeof existing?.gateway === "object" && existing.gateway ? existing.gateway : {};
 
 function buildSanitizedConfig() {
-const cfg = {};
-cfg.gateway = {};
+  const cfg = {};
+  cfg.gateway = {};
 
-cfg.gateway.port = Number(internalPort);
+  cfg.gateway.port = Number(internalPort);
 
-const trusted = uniq([
-…(Array.isArray(existingGateway.trustedProxies) ? existingGateway.trustedProxies : []),
-…parseTrustedProxies(),
-]);
-cfg.gateway.trustedProxies = trusted;
+  const trusted = uniq([
+    ...(Array.isArray(existingGateway.trustedProxies) ? existingGateway.trustedProxies : []),
+    ...parseTrustedProxies(),
+  ]);
+  cfg.gateway.trustedProxies = trusted;
 
-// Only write auth settings if token auth is explicitly enabled.
-if (enforceTokenAuth && token) {
-cfg.gateway.auth = { mode: “token”, token };
-console.log(”[railway-start] gateway auth enabled (token)”);
-} else {
-delete cfg.gateway.auth;
-console.log(”[railway-start] gateway auth not configured”);
-}
+  // Only write auth settings if token auth is explicitly enabled.
+  if (enforceTokenAuth && token) {
+    cfg.gateway.auth = { mode: "token", token };
+    console.log("[railway-start] gateway auth enabled (token)");
+  } else {
+    delete cfg.gateway.auth;
+    console.log("[railway-start] gateway auth not configured");
+  }
 
-return { cfg, trusted };
+  return { cfg, trusted };
 }
 
 function buildCompatConfig() {
-const base = typeof existing === “object” && existing ? existing : {};
-base.gateway = typeof base.gateway === “object” && base.gateway ? base.gateway : {};
+  const base = typeof existing === "object" && existing ? existing : {};
+  base.gateway = typeof base.gateway === "object" && base.gateway ? base.gateway : {};
 
-base.gateway.port = Number(internalPort);
+  base.gateway.port = Number(internalPort);
 
-const trusted = uniq([
-…(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
-…parseTrustedProxies(),
-]);
-base.gateway.trustedProxies = trusted;
+  const trusted = uniq([
+    ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
+    ...parseTrustedProxies(),
+  ]);
+  base.gateway.trustedProxies = trusted;
 
-// Strip known-invalid keys
-delete base.trustProxy;
-delete base.trustedProxies;
-if (base.gateway) {
-delete base.gateway.trustProxy;
-delete base.gateway.trustProxies;
-delete base.gateway.pairingRequired;
-}
+  // Strip known-invalid keys
+  delete base.trustProxy;
+  delete base.trustedProxies;
+  if (base.gateway) {
+    delete base.gateway.trustProxy;
+    delete base.gateway.trustProxies;
+    delete base.gateway.pairingRequired;
+  }
 
-// Only write auth settings if token auth is explicitly enabled.
-if (enforceTokenAuth && token) {
-base.gateway.auth = base.gateway.auth || {};
-base.gateway.auth.mode = “token”;
-base.gateway.auth.token = token;
-console.log(”[railway-start] gateway auth enabled (token)”);
-} else {
-delete base.gateway.auth;
-console.log(”[railway-start] gateway auth not configured”);
-}
+  // Only write auth settings if token auth is explicitly enabled.
+  if (enforceTokenAuth && token) {
+    base.gateway.auth = base.gateway.auth || {};
+    base.gateway.auth.mode = "token";
+    base.gateway.auth.token = token;
+    console.log("[railway-start] gateway auth enabled (token)");
+  } else {
+    delete base.gateway.auth;
+    console.log("[railway-start] gateway auth not configured");
+  }
 
-return { cfg: base, trusted };
+  return { cfg: base, trusted };
 }
 
 let trusted = [];
 let configToWrite = null;
 
 if (selfSanitize) {
-const built = buildSanitizedConfig();
-configToWrite = built.cfg;
-trusted = built.trusted;
+  const built = buildSanitizedConfig();
+  configToWrite = built.cfg;
+  trusted = built.trusted;
 
-const existingRootKeys = Object.keys(typeof existing === “object” && existing ? existing : {});
-const keptRootKeys = [“gateway”];
-const droppedRoot = existingRootKeys.filter((k) => !keptRootKeys.includes(k));
-if (droppedRoot.length) {
-console.log(”[railway-start] selfSanitize: dropped root keys:”, droppedRoot.join(”, “));
-}
+  const existingRootKeys = Object.keys(typeof existing === "object" && existing ? existing : {});
+  const keptRootKeys = ["gateway"];
+  const droppedRoot = existingRootKeys.filter((k) => !keptRootKeys.includes(k));
+  if (droppedRoot.length) {
+    console.log("[railway-start] selfSanitize: dropped root keys:", droppedRoot.join(", "));
+  }
 
-const existingGwKeys = Object.keys(existingGateway);
-const keptGwKeys = [“port”, “trustedProxies”, “auth”];
-const droppedGw = existingGwKeys.filter((k) => !keptGwKeys.includes(k));
-if (droppedGw.length) {
-console.log(”[railway-start] selfSanitize: dropped gateway keys:”, droppedGw.join(”, “));
-}
+  const existingGwKeys = Object.keys(existingGateway);
+  const keptGwKeys = ["port", "trustedProxies", "auth"];
+  const droppedGw = existingGwKeys.filter((k) => !keptGwKeys.includes(k));
+  if (droppedGw.length) {
+    console.log("[railway-start] selfSanitize: dropped gateway keys:", droppedGw.join(", "));
+  }
 } else {
-const built = buildCompatConfig();
-configToWrite = built.cfg;
-trusted = built.trusted;
+  const built = buildCompatConfig();
+  configToWrite = built.cfg;
+  trusted = built.trusted;
 }
 
 safeWriteJson(configA, configToWrite);
@@ -617,51 +616,51 @@ safeWriteJson(configB, configToWrite);
 // 3) OPENAI_API_KEY              (auto-generate minimal auth-profiles.json)
 // 4) ANTHROPIC_API_KEY           (auto-generate minimal auth-profiles.json)
 (function writeAuthProfilesIfProvided() {
-const jsonRaw = envStr(“OPENCLAW_AUTH_PROFILES_JSON”, “”).trim();
-const b64 = envStr(“OPENCLAW_AUTH_PROFILES_B64”, “”).trim();
-const openaiKey = envStr(“OPENAI_API_KEY”, “”).trim();
-const anthropicKey = envStr(“ANTHROPIC_API_KEY”, “”).trim();
+  const jsonRaw = envStr("OPENCLAW_AUTH_PROFILES_JSON", "").trim();
+  const b64 = envStr("OPENCLAW_AUTH_PROFILES_B64", "").trim();
+  const openaiKey = envStr("OPENAI_API_KEY", "").trim();
+  const anthropicKey = envStr("ANTHROPIC_API_KEY", "").trim();
 
-if (!jsonRaw && !b64 && !openaiKey && !anthropicKey) {
-console.log(
-“[railway-start] no auth profiles env vars found (OPENCLAW_AUTH_PROFILES_JSON, OPENCLAW_AUTH_PROFILES_B64, OPENAI_API_KEY, ANTHROPIC_API_KEY)”
-);
-return;
-}
+  if (!jsonRaw && !b64 && !openaiKey && !anthropicKey) {
+    console.log(
+      "[railway-start] no auth profiles env vars found (OPENCLAW_AUTH_PROFILES_JSON, OPENCLAW_AUTH_PROFILES_B64, OPENAI_API_KEY, ANTHROPIC_API_KEY)"
+    );
+    return;
+  }
 
-const agentAuthDir = path.join(stateDir, “agents”, “main”, “agent”);
-const authPath = path.join(agentAuthDir, “auth-profiles.json”);
+  const agentAuthDir = path.join(stateDir, "agents", "main", "agent");
+  const authPath = path.join(agentAuthDir, "auth-profiles.json");
 
-safeMkdir(agentAuthDir);
+  safeMkdir(agentAuthDir);
 
-if (jsonRaw) {
-console.log(”[railway-start] writing auth-profiles.json from OPENCLAW_AUTH_PROFILES_JSON”);
-safeWriteText(authPath, jsonRaw);
-return;
-}
+  if (jsonRaw) {
+    console.log("[railway-start] writing auth-profiles.json from OPENCLAW_AUTH_PROFILES_JSON");
+    safeWriteText(authPath, jsonRaw);
+    return;
+  }
 
-if (b64) {
-console.log(”[railway-start] writing auth-profiles.json from OPENCLAW_AUTH_PROFILES_B64”);
-try {
-const buf = Buffer.from(b64, “base64”);
-safeWriteText(authPath, buf.toString(“utf8”));
-} catch (e) {
-console.log(`[railway-start] failed to decode OPENCLAW_AUTH_PROFILES_B64: ${e?.message || e}`);
-}
-return;
-}
+  if (b64) {
+    console.log("[railway-start] writing auth-profiles.json from OPENCLAW_AUTH_PROFILES_B64");
+    try {
+      const buf = Buffer.from(b64, "base64");
+      safeWriteText(authPath, buf.toString("utf8"));
+    } catch (e) {
+      console.log(`[railway-start] failed to decode OPENCLAW_AUTH_PROFILES_B64: ${e?.message || e}`);
+    }
+    return;
+  }
 
-const authObj = {};
-if (openaiKey) authObj.openai = { apiKey: openaiKey };
-if (anthropicKey) authObj.anthropic = { apiKey: anthropicKey };
+  const authObj = {};
+  if (openaiKey) authObj.openai = { apiKey: openaiKey };
+  if (anthropicKey) authObj.anthropic = { apiKey: anthropicKey };
 
-console.log(”[railway-start] auto-generating auth-profiles.json from API key env vars”);
-safeWriteJson(authPath, authObj);
+  console.log("[railway-start] auto-generating auth-profiles.json from API key env vars");
+  safeWriteJson(authPath, authObj);
 })();
 
-// —————————
+// -----------------
 // OpenClaw process state
-// —————————
+// -----------------
 let claw = null;
 let clawStarting = false;
 let clawReady = false;
@@ -670,919 +669,649 @@ let restartAttempt = 0;
 let startLoopId = 0;
 let restartScheduled = false;
 
-const MAX_LOG_LINES = envInt(“OPENCLAW_LOG_RING_MAX”, 300);
+const MAX_LOG_LINES = envInt("OPENCLAW_LOG_RING_MAX", 300);
 const outRing = [];
 const errRing = [];
 
 function pushRing(arr, line) {
-arr.push(line);
-while (arr.length > MAX_LOG_LINES) arr.shift();
+  arr.push(line);
+  while (arr.length > MAX_LOG_LINES) arr.shift();
 }
 
 function dumpRing(label, arr) {
-if (!arr.length) return;
-console.log(label, “last”, arr.length, “lines”);
-for (const ln of arr) console.log(label, ln);
+  if (!arr.length) return;
+  console.log(label, "last", arr.length, "lines");
+  for (const ln of arr) console.log(label, ln);
 }
 
 function computeBackoffMs(attempt) {
-const a = clamp(attempt, 0, 8);
-const baseMs = 800 * Math.pow(1.7, a);
-const jitter = Math.floor(Math.random() * 350);
-return clamp(Math.floor(baseMs + jitter), 800, 20000);
+  const a = clamp(attempt, 0, 8);
+  const baseMs = 800 * Math.pow(1.7, a);
+  const jitter = Math.floor(Math.random() * 350);
+  return clamp(Math.floor(baseMs + jitter), 800, 20000);
 }
 
 function killChild(child) {
-if (!child) return;
-try {
-child.kill(“SIGTERM”);
-} catch {}
-setTimeout(() => {
-try {
-child.kill(“SIGKILL”);
-} catch {}
-}, 2500);
+  if (!child) return;
+  try {
+    child.kill("SIGTERM");
+  } catch {}
+  setTimeout(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch {}
+  }, 2500);
 }
 
 function scheduleRestart(waitMs) {
-if (restartScheduled) return;
-restartScheduled = true;
-console.log(”[railway-start] restarting in”, waitMs, “ms”);
-setTimeout(() => {
-restartScheduled = false;
-startOpenClawLoop();
-}, waitMs);
+  if (restartScheduled) return;
+  restartScheduled = true;
+  console.log("[railway-start] restarting in", waitMs, "ms");
+  setTimeout(() => {
+    restartScheduled = false;
+    startOpenClawLoop();
+  }, waitMs);
 }
 
 function resolveOpenClawCommand() {
-const override = envStr(“OPENCLAW_CMD”, “”).trim();
-if (override) {
-const parts = shellSplit(override);
-console.log(”[railway-start] using OPENCLAW_CMD override:”, parts.join(” “));
-if (parts.length === 0) return null;
-return { kind: “direct”, cmd: parts[0], argsPrefix: parts.slice(1) };
-}
+  const override = envStr("OPENCLAW_CMD", "").trim();
+  if (override) {
+    const parts = shellSplit(override);
+    console.log("[railway-start] using OPENCLAW_CMD override:", parts.join(" "));
+    if (parts.length === 0) return null;
+    return { kind: "direct", cmd: parts[0], argsPrefix: parts.slice(1) };
+  }
 
-const localBin = path.resolve(“node_modules”, “.bin”, “openclaw”);
-if (fs.existsSync(localBin)) {
-console.log(”[railway-start] found local openclaw bin:”, localBin);
-return { kind: “localbin”, cmd: localBin, argsPrefix: [] };
-}
+  const localBin = path.resolve("node_modules", ".bin", "openclaw");
+  if (fs.existsSync(localBin)) {
+    console.log("[railway-start] found local openclaw bin:", localBin);
+    return { kind: "localbin", cmd: localBin, argsPrefix: [] };
+  }
 
-const entryMjs = path.resolve(“openclaw.mjs”);
-if (fs.existsSync(entryMjs)) {
-console.log(”[railway-start] found openclaw.mjs:”, entryMjs);
-return { kind: “node”, cmd: process.execPath, argsPrefix: [entryMjs] };
-}
+  const entryMjs = path.resolve("openclaw.mjs");
+  if (fs.existsSync(entryMjs)) {
+    console.log("[railway-start] found openclaw.mjs:", entryMjs);
+    return { kind: "node", cmd: process.execPath, argsPrefix: [entryMjs] };
+  }
 
-const distEntry = path.resolve(“dist”, “index.js”);
-if (fs.existsSync(distEntry)) {
-console.log(”[railway-start] found dist/index.js:”, distEntry);
-return { kind: “node”, cmd: process.execPath, argsPrefix: [distEntry] };
-}
+  const distEntry = path.resolve("dist", "index.js");
+  if (fs.existsSync(distEntry)) {
+    console.log("[railway-start] found dist/index.js:", distEntry);
+    return { kind: "node", cmd: process.execPath, argsPrefix: [distEntry] };
+  }
 
-return null;
+  return null;
 }
 
 function buildOpenClawArgs(bindMode) {
-const args = [
-“gateway”,
-“–allow-unconfigured”,
-“–bind”,
-String(bindMode),
-“–port”,
-String(internalPort),
-];
+  const args = [
+    "gateway",
+    "--allow-unconfigured",
+    "--bind",
+    String(bindMode),
+    "--port",
+    String(internalPort),
+  ];
 
-// If we pass token to the child, also pass via CLI (some builds prefer this).
-if (passGatewayTokenToChild && token) {
-args.push(”–token”, token);
-}
+  // If we pass token to the child, also pass via CLI (some builds prefer this).
+  if (passGatewayTokenToChild && token) {
+    args.push("--token", token);
+  }
 
-if (forceEnabled) {
-args.push(”–force”);
-} else if (forceRequested && !forceEnabled) {
-console.log(”[railway-start] OPENCLAW_FORCE=1 requested but lsof is missing, skipping –force”);
-}
+  if (forceEnabled) {
+    args.push("--force");
+  } else if (forceRequested && !forceEnabled) {
+    console.log("[railway-start] OPENCLAW_FORCE=1 requested but lsof is missing, skipping --force");
+  }
 
-// Fix #8: bypass missing system utilities like lsof on Railway containers
-if (noDoctorEnabled) {
-args.push(”–no-doctor”);
-}
+  // bypass missing system utilities like lsof on Railway containers
+  if (noDoctorEnabled) {
+    args.push("--no-doctor");
+  }
 
-return args;
+  return args;
 }
 
 function currentBindForAttempt(attempt) {
-return attempt >= 2 ? bindFallback : bindPrimary;
+  return attempt >= 2 ? bindFallback : bindPrimary;
 }
 
 function spawnOpenClawProcess(bindMode) {
-const childEnv = { …process.env, OPENCLAW_STATE_DIR: stateDir };
+  const childEnv = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
 
-if (passGatewayTokenToChild && token) {
-childEnv.OPENCLAW_GATEWAY_TOKEN = token;
-}
+  if (passGatewayTokenToChild && token) {
+    childEnv.OPENCLAW_GATEWAY_TOKEN = token;
+  }
 
-// Prevent accidental token enforcement inside OpenClaw when you only want proxy-level token checks
-if (!passGatewayTokenToChild) {
-delete childEnv.OPENCLAW_GATEWAY_TOKEN;
-delete childEnv.OPENCLAW_ENFORCE_TOKEN_AUTH;
-}
+  // Prevent accidental token enforcement inside OpenClaw when you only want proxy-level token checks
+  if (!passGatewayTokenToChild) {
+    delete childEnv.OPENCLAW_GATEWAY_TOKEN;
+    delete childEnv.OPENCLAW_ENFORCE_TOKEN_AUTH;
+  }
 
-const resolved = resolveOpenClawCommand();
-if (!resolved) {
-throw new Error(
-“Could not find OpenClaw entry. Missing node_modules/.bin/openclaw, openclaw.mjs, and dist/index.js.”
-);
-}
+  const resolved = resolveOpenClawCommand();
+  if (!resolved) {
+    throw new Error(
+      "Could not find OpenClaw entry. Missing node_modules/.bin/openclaw, openclaw.mjs, and dist/index.js."
+    );
+  }
 
-const args = […resolved.argsPrefix, …buildOpenClawArgs(bindMode)];
+  const args = [...resolved.argsPrefix, ...buildOpenClawArgs(bindMode)];
 
-if (resolved.kind === “localbin” && useShellForLocalBin) {
-const cmdLine = shJoin(resolved.cmd, args);
-console.log(”[railway-start] exec shell:”, cmdLine);
-return spawn(cmdLine, {
-stdio: [“ignore”, “pipe”, “pipe”],
-env: childEnv,
-shell: true,
-});
-}
+  if (resolved.kind === "localbin" && useShellForLocalBin) {
+    const cmdLine = shJoin(resolved.cmd, args);
+    console.log("[railway-start] exec shell:", cmdLine);
+    return spawn(cmdLine, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: childEnv,
+      shell: true,
+    });
+  }
 
-console.log(”[railway-start] exec:”, [resolved.cmd, …args].join(” “));
-return spawn(resolved.cmd, args, { stdio: [“ignore”, “pipe”, “pipe”], env: childEnv });
+  console.log("[railway-start] exec:", [resolved.cmd, ...args].join(" "));
+  return spawn(resolved.cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
 }
 
 async function isPortReadyAnyHost() {
-const hosts = [“127.0.0.1”, “localhost”, “::1”];
-for (const h of hosts) {
-const ok = await tcpCheck(h, internalPort, 700);
-if (ok) return { ok: true, host: h };
-}
-return { ok: false, host: null };
+  const hosts = ["127.0.0.1", "localhost", "::1"];
+  for (const h of hosts) {
+    const ok = await tcpCheck(h, internalPort, 700);
+    if (ok) return { ok: true, host: h };
+  }
+  return { ok: false, host: null };
 }
 
 const proxyAgentHttp = new http.Agent({ keepAlive: true });
 const proxyAgentHttps = new https.Agent({ keepAlive: true });
 
 function selectUpstreamClient() {
-return upstreamProtocol === “https” ? https : http;
+  return upstreamProtocol === "https" ? https : http;
 }
 
 function selectUpstreamAgent() {
-return upstreamProtocol === “https” ? proxyAgentHttps : proxyAgentHttp;
+  return upstreamProtocol === "https" ? proxyAgentHttps : proxyAgentHttp;
 }
 
 function applyGatewayTokenToHeaders(headers) {
-if (!enforceTokenAuth) return headers;
-if (!token) return headers;
-if (!injectGatewayTokenHeaders) return headers;
+  if (!enforceTokenAuth) return headers;
+  if (!token) return headers;
+  if (!injectGatewayTokenHeaders) return headers;
 
-const h = { …(headers || {}) };
+  const h = { ...(headers || {}) };
 
-// Always force correct token upstream to prevent mismatches.
-h[“x-openclaw-token”] = token;
-h[“authorization”] = `Bearer ${token}`;
+  // Always force correct token upstream to prevent mismatches.
+  h["x-openclaw-token"] = token;
+  h["authorization"] = `Bearer ${token}`;
 
-return h;
+  return h;
 }
 
 async function httpReadyCheckOnce(pathToCheck) {
-const client = selectUpstreamClient();
-const agent = selectUpstreamAgent();
+  const client = selectUpstreamClient();
+  const agent = selectUpstreamAgent();
 
-let headers = {
-host: upstreamHostHeaderOverride || buildLocalHostHeader(upstreamHost, internalPort),
-accept: “text/plain,application/json,*/*”,
-“user-agent”: “railway-start-readycheck”,
-};
+  let headers = {
+    host: upstreamHostHeaderOverride || buildLocalHostHeader(upstreamHost, internalPort),
+    accept: "text/plain,application/json,*/*",
+    "user-agent": "railway-start-readycheck",
+  };
 
-headers = applyGatewayTokenToHeaders(headers);
+  headers = applyGatewayTokenToHeaders(headers);
 
-const options = {
-agent,
-hostname: upstreamHost,
-port: internalPort,
-method: “GET”,
-path: pathToCheck,
-headers,
-timeout: readyTimeoutMs,
-};
+  const options = {
+    agent,
+    hostname: upstreamHost,
+    port: internalPort,
+    method: "GET",
+    path: pathToCheck,
+    headers,
+    timeout: readyTimeoutMs,
+  };
 
-if (upstreamProtocol === “https”) {
-options.rejectUnauthorized = !upstreamInsecure;
-}
+  if (upstreamProtocol === "https") {
+    options.rejectUnauthorized = !upstreamInsecure;
+  }
 
-return new Promise((resolve) => {
-const req = client.request(options, (res) => {
-const code = Number(res.statusCode || 0);
-res.resume();
-resolve({ ok: matchesReadyExpect(code, readyExpectSpec), code, path: pathToCheck });
-});
-req.on(“timeout”, () => {
-try {
-req.destroy(new Error(“ready timeout”));
-} catch {}
-resolve({ ok: false, code: 0, path: pathToCheck, timeout: true });
-});
-req.on(“error”, () => resolve({ ok: false, code: 0, path: pathToCheck, error: true }));
-req.end();
-});
+  return new Promise((resolve) => {
+    const req = client.request(options, (res) => {
+      const code = Number(res.statusCode || 0);
+      res.resume();
+      resolve({ ok: matchesReadyExpect(code, readyExpectSpec), code, path: pathToCheck });
+    });
+    req.on("timeout", () => {
+      try {
+        req.destroy(new Error("ready timeout"));
+      } catch {}
+      resolve({ ok: false, code: 0, path: pathToCheck, timeout: true });
+    });
+    req.on("error", () => resolve({ ok: false, code: 0, path: pathToCheck, error: true }));
+    req.end();
+  });
 }
 
 async function isOpenClawReadySignal() {
-if (readyCheckMode === “tcp”) {
-const r = await isPortReadyAnyHost();
-return { ok: r.ok, detail: r };
-}
+  if (readyCheckMode === "tcp") {
+    const r = await isPortReadyAnyHost();
+    return { ok: r.ok, detail: r };
+  }
 
-// http mode: require TCP first, then HTTP path (with fallbacks)
-const r = await isPortReadyAnyHost();
-if (!r.ok) return { ok: false, detail: r };
+  // http mode: require TCP first, then HTTP path (with fallbacks)
+  const r = await isPortReadyAnyHost();
+  if (!r.ok) return { ok: false, detail: r };
 
-// First try primary path
-const first = await httpReadyCheckOnce(readyPath);
-if (first.ok) {
-return {
-ok: true,
-detail: { …r, http: true, path: first.path, code: first.code, expect: readyExpectRaw },
-};
-}
+  // First try primary path
+  const first = await httpReadyCheckOnce(readyPath);
+  if (first.ok) {
+    return {
+      ok: true,
+      detail: { ...r, http: true, path: first.path, code: first.code, expect: readyExpectRaw },
+    };
+  }
 
-// Then try fallbacks (excluding the primary if duplicated)
-for (const p of readyFallbackPaths) {
-if (p === readyPath) continue;
-const chk = await httpReadyCheckOnce(p);
-if (chk.ok) {
-return {
-ok: true,
-detail: { …r, http: true, path: chk.path, code: chk.code, expect: readyExpectRaw },
-};
-}
-}
+  // Then try fallbacks (excluding the primary if duplicated)
+  for (const p of readyFallbackPaths) {
+    if (p === readyPath) continue;
+    const chk = await httpReadyCheckOnce(p);
+    if (chk.ok) {
+      return {
+        ok: true,
+        detail: { ...r, http: true, path: chk.path, code: chk.code, expect: readyExpectRaw },
+      };
+    }
+  }
 
-return {
-ok: false,
-detail: {
-…r,
-http: false,
-pathTried: [readyPath, …readyFallbackPaths.filter((p) => p !== readyPath)],
-last: { path: first.path, code: first.code },
-expect: readyExpectRaw,
-},
-};
+  return {
+    ok: false,
+    detail: {
+      ...r,
+      http: false,
+      pathTried: [readyPath, ...readyFallbackPaths.filter((p) => p !== readyPath)],
+      last: { path: first.path, code: first.code },
+      expect: readyExpectRaw,
+    },
+  };
 }
 
 async function waitForOpenClawReady(timeoutMs, child) {
-const start = Date.now();
-const deadline = start + timeoutMs;
+  const start = Date.now();
+  const deadline = start + timeoutMs;
 
-await sleep(800);
+  await sleep(800);
 
-let lastLogAt = 0;
+  let lastLogAt = 0;
 
-while (Date.now() < deadline) {
-if (child && child.exitCode != null) {
-console.log(”[railway-start] child already exited while waiting, exitCode =”, child.exitCode);
-return false;
-}
+  while (Date.now() < deadline) {
+    if (child && child.exitCode != null) {
+      console.log("[railway-start] child already exited while waiting, exitCode =", child.exitCode);
+      return false;
+    }
 
-```
-const sig = await isOpenClawReadySignal();
-if (sig.ok) {
-  if (readyCheckMode === "tcp") {
-    console.log("[railway-start] TCP ready on host", sig.detail.host, "port", internalPort);
-  } else {
-    console.log(
-      "[railway-start] ready via HTTP",
-      "host",
-      sig.detail.host,
-      "port",
-      internalPort,
-      "path",
-      sig.detail.path,
-      "code",
-      sig.detail.code,
-      "expect",
-      readyExpectRaw
-    );
+    const sig = await isOpenClawReadySignal();
+    if (sig.ok) {
+      if (readyCheckMode === "tcp") {
+        console.log("[railway-start] TCP ready on host", sig.detail.host, "port", internalPort);
+      } else {
+        console.log(
+          "[railway-start] ready via HTTP",
+          "host",
+          sig.detail.host,
+          "port",
+          internalPort,
+          "path",
+          sig.detail.path,
+          "code",
+          sig.detail.code,
+          "expect",
+          readyExpectRaw
+        );
+      }
+      return true;
+    }
+
+    const now = Date.now();
+    if (now - lastLogAt > 5000) {
+      lastLogAt = now;
+      const elapsed = now - start;
+      const remaining = Math.max(0, deadline - now);
+      console.log(
+        "[railway-start] waiting for readiness",
+        "mode",
+        readyCheckMode,
+        "elapsed",
+        elapsed,
+        "ms",
+        "remaining",
+        remaining,
+        "ms"
+      );
+    }
+
+    await sleep(450);
   }
-  return true;
-}
 
-const now = Date.now();
-if (now - lastLogAt > 5000) {
-  lastLogAt = now;
-  const elapsed = now - start;
-  const remaining = Math.max(0, deadline - now);
-  console.log(
-    "[railway-start] waiting for readiness",
-    "mode",
-    readyCheckMode,
-    "elapsed",
-    elapsed,
-    "ms",
-    "remaining",
-    remaining,
-    "ms"
-  );
-}
-
-await sleep(450);
-```
-
-}
-
-return false;
+  return false;
 }
 
 async function startOpenClawLoop() {
-const myLoopId = ++startLoopId;
+  const myLoopId = ++startLoopId;
 
-if (clawStarting) {
-console.log(”[railway-start] OpenClaw start already in progress, skipping”);
-return;
-}
-
-if (claw) {
-console.log(”[railway-start] OpenClaw already running, skipping”);
-return;
-}
-
-clawStarting = true;
-clawReady = false;
-
-outRing.length = 0;
-errRing.length = 0;
-
-const bindMode = currentBindForAttempt(restartAttempt);
-console.log(”[railway-start] starting attempt”, restartAttempt + 1, “bind =”, bindMode);
-
-try {
-claw = spawnOpenClawProcess(bindMode);
-console.log(”[railway-start] OpenClaw spawned PID:”, claw.pid);
-} catch (e) {
-console.error(”[railway-start] Failed to spawn OpenClaw:”, e?.message || e);
-claw = null;
-clawStarting = false;
-
-```
-restartAttempt += 1;
-const waitMs = computeBackoffMs(restartAttempt);
-console.log("[railway-start] spawn failed, retrying in", waitMs, "ms");
-await sleep(waitMs);
-
-if (myLoopId === startLoopId) startOpenClawLoop();
-return;
-```
-
-}
-
-// Fix #3: Removed overly broad markReadyFromLine that could false-positive on
-// unrelated log lines like “not ready” or “already started something else”.
-// Readiness is determined solely by the proper readiness checks in waitForOpenClawReady.
-
-if (claw.stdout) {
-claw.stdout.on(“data”, (data) => {
-const lines = data
-.toString()
-.split(”\n”)
-.map((x) => x.trimEnd())
-.filter(Boolean);
-for (const ln of lines) {
-pushRing(outRing, ln);
-console.log(”[openclaw]”, ln);
-}
-});
-claw.stdout.on(“end”, () => console.log(”[railway-start] child stdout ended”));
-}
-
-if (claw.stderr) {
-claw.stderr.on(“data”, (data) => {
-const lines = data
-.toString()
-.split(”\n”)
-.map((x) => x.trimEnd())
-.filter(Boolean);
-
-```
-  for (const ln of lines) {
-    pushRing(errRing, ln);
-    console.error("[openclaw ERROR]", ln);
-
-    // Auto-heal: OpenClaw says auth token mode but token is missing
-    if (autoPassTokenOnAuthError && !passGatewayTokenToChild && token) {
-      const low = String(ln || "").toLowerCase();
-      const hit =
-        low.includes("gateway auth is set to token") &&
-        (low.includes("no token is configured") || low.includes("set gateway.auth.token"));
-
-      if (hit) {
-        passGatewayTokenToChild = true;
-        console.log(
-          "[railway-start] detected auth token missing; enabling passGatewayTokenToChild for next restart"
-        );
-      }
-    }
+  if (clawStarting) {
+    console.log("[railway-start] OpenClaw start already in progress, skipping");
+    return;
   }
-});
-claw.stderr.on("end", () => console.log("[railway-start] child stderr ended"));
-```
 
-}
+  if (claw) {
+    console.log("[railway-start] OpenClaw already running, skipping");
+    return;
+  }
 
-claw.on(“exit”, (code, signal) => {
-console.log(”[railway-start] OpenClaw exited code:”, code, “signal:”, signal);
+  clawStarting = true;
+  clawReady = false;
 
-```
-dumpRing("[railway-start][openclaw STDOUT]", outRing);
-dumpRing("[railway-start][openclaw STDERR]", errRing);
+  outRing.length = 0;
+  errRing.length = 0;
 
-if (myLoopId !== startLoopId) {
-  console.log("[railway-start] Superseded by newer start attempt, not restarting");
-  return;
-}
+  const bindMode = currentBindForAttempt(restartAttempt);
+  console.log("[railway-start] starting attempt", restartAttempt + 1, "bind =", bindMode);
 
-claw = null;
-clawStarting = false;
-clawReady = false;
+  try {
+    claw = spawnOpenClawProcess(bindMode);
+    console.log("[railway-start] OpenClaw spawned PID:", claw.pid);
+  } catch (e) {
+    console.error("[railway-start] Failed to spawn OpenClaw:", e?.message || e);
+    claw = null;
+    clawStarting = false;
 
-restartAttempt += 1;
-const waitMs = computeBackoffMs(restartAttempt);
-scheduleRestart(waitMs); // scheduleRestart already checks restartScheduled, safe from duplicates
-```
+    restartAttempt += 1;
+    const waitMs = computeBackoffMs(restartAttempt);
+    console.log("[railway-start] spawn failed, retrying in", waitMs, "ms");
+    await sleep(waitMs);
 
-});
+    if (myLoopId === startLoopId) startOpenClawLoop();
+    return;
+  }
 
-claw.on(“error”, (err) => {
-console.error(”[railway-start] OpenClaw process error:”, err?.message || err);
+  if (claw.stdout) {
+    claw.stdout.on("data", (data) => {
+      const lines = data
+        .toString()
+        .split("\n")
+        .map((x) => x.trimEnd())
+        .filter(Boolean);
+      for (const ln of lines) {
+        pushRing(outRing, ln);
+        console.log("[openclaw]", ln);
+      }
+    });
+    claw.stdout.on("end", () => console.log("[railway-start] child stdout ended"));
+  }
 
-```
-dumpRing("[railway-start][openclaw STDOUT]", outRing);
-dumpRing("[railway-start][openclaw STDERR]", errRing);
+  if (claw.stderr) {
+    claw.stderr.on("data", (data) => {
+      const lines = data
+        .toString()
+        .split("\n")
+        .map((x) => x.trimEnd())
+        .filter(Boolean);
 
-if (myLoopId !== startLoopId) {
-  console.log("[railway-start] Superseded, not restarting");
-  return;
-}
+      for (const ln of lines) {
+        pushRing(errRing, ln);
+        console.error("[openclaw ERROR]", ln);
 
-const child = claw;
-claw = null;
-clawStarting = false;
-clawReady = false;
+        // Auto-heal: OpenClaw says auth token mode but token is missing
+        if (autoPassTokenOnAuthError && !passGatewayTokenToChild && token) {
+          const low = String(ln || "").toLowerCase();
+          const hit =
+            low.includes("gateway auth is set to token") &&
+            (low.includes("no token is configured") || low.includes("set gateway.auth.token"));
 
-try {
-  if (child) killChild(child);
-} catch {}
+          if (hit) {
+            passGatewayTokenToChild = true;
+            console.log(
+              "[railway-start] detected auth token missing; enabling passGatewayTokenToChild for next restart"
+            );
+          }
+        }
+      }
+    });
+    claw.stderr.on("end", () => console.log("[railway-start] child stderr ended"));
+  }
 
-restartAttempt += 1;
-const waitMs = computeBackoffMs(restartAttempt);
-scheduleRestart(waitMs);
-```
+  claw.on("exit", (code, signal) => {
+    console.log("[railway-start] OpenClaw exited code:", code, "signal:", signal);
 
-});
+    dumpRing("[railway-start][openclaw STDOUT]", outRing);
+    dumpRing("[railway-start][openclaw STDERR]", errRing);
 
-const becameReady = await waitForOpenClawReady(startupTimeoutMs, claw);
+    if (myLoopId !== startLoopId) {
+      console.log("[railway-start] Superseded by newer start attempt, not restarting");
+      return;
+    }
 
-if (myLoopId !== startLoopId) {
-clawStarting = false;
-return;
-}
+    claw = null;
+    clawStarting = false;
+    clawReady = false;
 
-if (!becameReady) {
-console.error(”[railway-start] OpenClaw did not become ready in time, restarting”);
-dumpRing(”[railway-start][openclaw STDOUT]”, outRing);
-dumpRing(”[railway-start][openclaw STDERR]”, errRing);
+    restartAttempt += 1;
+    const waitMs = computeBackoffMs(restartAttempt);
+    scheduleRestart(waitMs);
+  });
 
-```
-// Fix #1: Increment startLoopId BEFORE killing child to prevent the child's
-// exit handler from scheduling a duplicate restart on top of ours.
-startLoopId++;
+  claw.on("error", (err) => {
+    console.error("[railway-start] OpenClaw process error:", err?.message || err);
 
-const child = claw;
-claw = null;
-clawReady = false;
-clawStarting = false;
-killChild(child);
+    dumpRing("[railway-start][openclaw STDOUT]", outRing);
+    dumpRing("[railway-start][openclaw STDERR]", errRing);
 
-restartAttempt += 1;
-const waitMs = computeBackoffMs(restartAttempt);
-scheduleRestart(waitMs);
-return;
-```
+    if (myLoopId !== startLoopId) {
+      console.log("[railway-start] Superseded, not restarting");
+      return;
+    }
 
-}
+    const child = claw;
+    claw = null;
+    clawStarting = false;
+    clawReady = false;
 
-restartAttempt = 0;
-clawStarting = false;
-clawReady = true;
-console.log(”[railway-start] OpenClaw is ready”);
+    try {
+      if (child) killChild(child);
+    } catch {}
+
+    restartAttempt += 1;
+    const waitMs = computeBackoffMs(restartAttempt);
+    scheduleRestart(waitMs);
+  });
+
+  const becameReady = await waitForOpenClawReady(startupTimeoutMs, claw);
+
+  if (myLoopId !== startLoopId) {
+    clawStarting = false;
+    return;
+  }
+
+  if (!becameReady) {
+    console.error("[railway-start] OpenClaw did not become ready in time, restarting");
+    dumpRing("[railway-start][openclaw STDOUT]", outRing);
+    dumpRing("[railway-start][openclaw STDERR]", errRing);
+
+    // Increment startLoopId BEFORE killing child to prevent double restarts
+    startLoopId++;
+
+    const child = claw;
+    claw = null;
+    clawReady = false;
+    clawStarting = false;
+    killChild(child);
+
+    restartAttempt += 1;
+    const waitMs = computeBackoffMs(restartAttempt);
+    scheduleRestart(waitMs);
+    return;
+  }
+
+  restartAttempt = 0;
+  clawStarting = false;
+  clawReady = true;
+  console.log("[railway-start] OpenClaw is ready");
 }
 
 function normalizeToken(s) {
-return String(s || “”).trim();
+  return String(s || "").trim();
 }
 
 function checkProxyToken(req) {
-if (!enforceProxyToken) return { ok: true, reason: “disabled” };
-if (!token) return { ok: false, reason: “missing-server-token” };
+  if (!enforceProxyToken) return { ok: true, reason: "disabled" };
+  if (!token) return { ok: false, reason: "missing-server-token" };
 
-const hdr =
-normalizeToken(req.headers[“x-openclaw-token”]) ||
-normalizeToken(req.headers[“x-api-key”]) ||
-“”;
+  const hdr =
+    normalizeToken(req.headers["x-openclaw-token"]) ||
+    normalizeToken(req.headers["x-api-key"]) ||
+    "";
 
-const auth = normalizeToken(req.headers[“authorization”]);
-const bearer = auth.toLowerCase().startsWith(“bearer “) ? normalizeToken(auth.slice(7)) : “”;
+  const auth = normalizeToken(req.headers["authorization"]);
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? normalizeToken(auth.slice(7)) : "";
 
-const got = hdr || bearer;
-if (!got) return { ok: false, reason: “missing-client-token” };
-if (got !== token) return { ok: false, reason: “bad-client-token” };
+  const got = hdr || bearer;
+  if (!got) return { ok: false, reason: "missing-client-token" };
+  if (got !== token) return { ok: false, reason: "bad-client-token" };
 
-return { ok: true, reason: “ok” };
+  return { ok: true, reason: "ok" };
 }
 
 function isPublicUiPath(url) {
-const u = String(url || “/”);
-if (u === “/”) return true;
-if (u === “/favicon.ico”) return true;
-if (u === “/robots.txt”) return true;
-if (u.startsWith(”/assets/”)) return true;
-if (u.startsWith(”/static/”)) return true;
-if (u.startsWith(”/_next/”)) return true;
-return false;
+  const u = String(url || "/");
+  if (u === "/") return true;
+  if (u === "/favicon.ico") return true;
+  if (u === "/robots.txt") return true;
+  if (u.startsWith("/assets/")) return true;
+  if (u.startsWith("/static/")) return true;
+  if (u.startsWith("/_next/")) return true;
+  return false;
 }
 
 // Headers that trigger OpenClaw proxy detection and can cause pairing loops behind Railway.
 const PROXY_DERIVED_HEADERS = new Set([
-“forwarded”,
-“x-forwarded-for”,
-“x-forwarded-proto”,
-“x-forwarded-host”,
-“x-forwarded-port”,
-“x-forwarded-server”,
-“x-forwarded-ssl”,
-“x-forwarded-scheme”,
-“x-forwarded-prefix”,
-“x-original-forwarded-for”,
-“x-real-ip”,
-“true-client-ip”,
-“cf-connecting-ip”,
-“fastly-client-ip”,
-“x-client-ip”,
-“x-cluster-client-ip”,
+  "forwarded",
+  "x-forwarded-for",
+  "x-forwarded-proto",
+  "x-forwarded-host",
+  "x-forwarded-port",
+  "x-forwarded-server",
+  "x-forwarded-ssl",
+  "x-forwarded-scheme",
+  "x-forwarded-prefix",
+  "x-original-forwarded-for",
+  "x-real-ip",
+  "true-client-ip",
+  "cf-connecting-ip",
+  "fastly-client-ip",
+  "x-client-ip",
+  "x-cluster-client-ip",
 ]);
 
 function stripProxyDerivedHeaders(headersObj) {
-const out = {};
-for (const [k, v] of Object.entries(headersObj || {})) {
-const lk = String(k).toLowerCase();
-if (PROXY_DERIVED_HEADERS.has(lk)) continue;
-out[k] = v;
-}
-return out;
+  const out = {};
+  for (const [k, v] of Object.entries(headersObj || {})) {
+    const lk = String(k).toLowerCase();
+    if (PROXY_DERIVED_HEADERS.has(lk)) continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 function pickHostHeaderForUpstream(req, xfHost) {
-if (upstreamHostHeaderOverride) return upstreamHostHeaderOverride;
+  if (upstreamHostHeaderOverride) return upstreamHostHeaderOverride;
 
-const inboundHost = req.headers?.host || “”;
-const inboundIsLocal = isLocalHostHeader(inboundHost);
+  const inboundHost = req.headers?.host || "";
+  const inboundIsLocal = isLocalHostHeader(inboundHost);
 
-// If proxying to loopback and inbound Host is not local, rewrite Host to local for OpenClaw.
-if (isLoopbackHost(upstreamHost) && !inboundIsLocal) {
-return buildLocalHostHeader(upstreamHost, internalPort);
-}
+  // If proxying to loopback and inbound Host is not local, rewrite Host to local for OpenClaw.
+  if (isLoopbackHost(upstreamHost) && !inboundIsLocal) {
+    return buildLocalHostHeader(upstreamHost, internalPort);
+  }
 
-return xfHost || inboundHost || “”;
+  return xfHost || inboundHost || "";
 }
 
 function buildForwardedHeaders(req) {
-const remoteAddr = req.socket?.remoteAddress || “”;
+  const remoteAddr = req.socket?.remoteAddress || "";
 
-const dash = String.fromCharCode(45);
-const H_XFF = “x” + dash + “forwarded” + dash + “for”;
-const H_XFP = “x” + dash + “forwarded” + dash + “proto”;
-const H_XFH = “x” + dash + “forwarded” + dash + “host”;
-const H_XFPORT = “x” + dash + “forwarded” + dash + “port”;
-const H_XREAL = “x” + dash + “real” + dash + “ip”;
+  const dash = String.fromCharCode(45);
+  const H_XFF = "x" + dash + "forwarded" + dash + "for";
+  const H_XFP = "x" + dash + "forwarded" + dash + "proto";
+  const H_XFH = "x" + dash + "forwarded" + dash + "host";
+  const H_XFPORT = "x" + dash + "forwarded" + dash + "port";
+  const H_XREAL = "x" + dash + "real" + dash + "ip";
 
-const priorXff = req.headers[H_XFF] || req.headers[“x-forwarded-for”];
-const xff = priorXff ? `${priorXff}, ${remoteAddr}` : remoteAddr;
+  const priorXff = req.headers[H_XFF] || req.headers["x-forwarded-for"];
+  const xff = priorXff ? `${priorXff}, ${remoteAddr}` : remoteAddr;
 
-const xfProto =
-forwardedProtoOverride ||
-req.headers[H_XFP] ||
-req.headers[“x-forwarded-proto”] ||
-(req.socket?.encrypted ? “https” : “http”);
+  const xfProto =
+    forwardedProtoOverride ||
+    req.headers[H_XFP] ||
+    req.headers["x-forwarded-proto"] ||
+    (req.socket?.encrypted ? "https" : "http");
 
-const xfHost =
-forwardedHostOverride ||
-req.headers[H_XFH] ||
-req.headers[“x-forwarded-host”] ||
-req.headers.host ||
-“”;
+  const xfHost =
+    forwardedHostOverride || req.headers[H_XFH] || req.headers["x-forwarded-host"] || req.headers.host || "";
 
-const hopByHop = new Set([
-“connection”,
-“keep-alive”,
-“proxy-authenticate”,
-“proxy-authorization”,
-“te”,
-“trailers”,
-“transfer-encoding”,
-“upgrade”,
-]);
+  const hopByHop = new Set([
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+  ]);
 
-const cleaned = {};
-for (const [k, v] of Object.entries(req.headers || {})) {
-if (!hopByHop.has(String(k).toLowerCase())) cleaned[k] = v;
-}
+  const cleaned = {};
+  for (const [k, v] of Object.entries(req.headers || {})) {
+    if (!hopByHop.has(String(k).toLowerCase())) cleaned[k] = v;
+  }
 
-cleaned.host = pickHostHeaderForUpstream(req, xfHost);
+  cleaned.host = pickHostHeaderForUpstream(req, xfHost);
 
-// Self sanitize: strip proxy-derived headers and do not add x-forwarded-* back.
-if (selfSanitize) {
-const stripped = stripProxyDerivedHeaders(cleaned);
-stripped.host = cleaned.host || stripped.host || “”;
-return applyGatewayTokenToHeaders(stripped);
-}
+  // Self sanitize: strip proxy-derived headers and do not add x-forwarded-* back.
+  if (selfSanitize) {
+    const stripped = stripProxyDerivedHeaders(cleaned);
+    stripped.host = cleaned.host || stripped.host || "";
+    return applyGatewayTokenToHeaders(stripped);
+  }
 
-const withForwarded = {
-…cleaned,
-[H_XFP]: String(xfProto),
-[H_XFH]: String(xfHost),
-[H_XFF]: String(xff),
-[H_XREAL]: String(remoteAddr),
-[H_XFPORT]: String(externalPort),
-};
+  const withForwarded = {
+    ...cleaned,
+    [H_XFP]: String(xfProto),
+    [H_XFH]: String(xfHost),
+    [H_XFF]: String(xff),
+    [H_XREAL]: String(remoteAddr),
+    [H_XFPORT]: String(externalPort),
+  };
 
-return applyGatewayTokenToHeaders(withForwarded);
+  return applyGatewayTokenToHeaders(withForwarded);
 }
 
 async function isOpenClawReadyFast() {
-if (clawReady) return true;
-const sig = await isOpenClawReadySignal();
-return sig.ok;
+  if (clawReady) return true;
+  const sig = await isOpenClawReadySignal();
+  return sig.ok;
 }
 
 function serveJson(res, code, obj) {
-res.statusCode = code;
-res.setHeader(“content-type”, “application/json”);
-res.end(JSON.stringify(obj, null, 2));
+  res.statusCode = code;
+  res.setHeader("content-type", "application/json");
+  res.end(JSON.stringify(obj, null, 2));
 }
 
 function serveText(res, code, text) {
-res.statusCode = code;
-res.setHeader(“content-type”, “text/plain”);
-res.end(text);
+  res.statusCode = code;
+  res.setHeader("content-type", "text/plain");
+  res.end(text);
 }
 
 function requestUpstream(req, res) {
-const url = req.url || “/”;
-// Fix #6: buildForwardedHeaders already calls applyGatewayTokenToHeaders internally,
-// so we no longer call it a second time here (was harmless but redundant).
-const headers = buildForwardedHeaders(req);
-
-const client = selectUpstreamClient();
-const agent = selectUpstreamAgent();
-
-const options = {
-agent,
-hostname: upstreamHost,
-port: internalPort,
-method: req.method,
-path: url,
-headers,
-timeout: proxyTimeoutMs,
-};
-
-if (upstreamProtocol === “https”) {
-options.rejectUnauthorized = !upstreamInsecure;
-}
-
-const proxyReq = client.request(options, (proxyRes) => {
-res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
-proxyRes.pipe(res);
-});
-
-proxyReq.on(“timeout”, () => {
-try {
-proxyReq.destroy(new Error(“upstream timeout”));
-} catch {}
-});
-
-proxyReq.on(“error”, (err) => {
-console.log(”[railway-start] Proxy error:”, err?.message || err);
-serveText(res, 502, `Bad gateway: ${err?.message || err}. Check /debug.`);
-});
-
-req.pipe(proxyReq);
-}
-
-// If OpenClaw binds to externalPort, do not start wrapper server (port collision).
-if (openclawListenOnExternal) {
-console.log(”[railway-start] OPENCLAW_LISTEN_ON_EXTERNAL=1”);
-console.log(”[railway-start] wrapper HTTP server disabled to avoid EADDRINUSE”);
-console.log(”[railway-start] OpenClaw should serve /health /ready or its own endpoints”);
-console.log(”[railway-start] bind mode forced to lan in this mode”);
-
-setTimeout(() => startOpenClawLoop(), 0);
-
-setInterval(async () => {
-if (!claw || clawStarting) return;
-const ok = await isOpenClawReadyFast();
-if (ok) return;
-
-```
-console.error("[railway-start] watchdog: OpenClaw not ready, restarting");
-dumpRing("[railway-start][openclaw STDOUT]", outRing);
-dumpRing("[railway-start][openclaw STDERR]", errRing);
-
-const child = claw;
-claw = null;
-clawReady = false;
-killChild(child);
-
-restartAttempt = Math.max(1, restartAttempt);
-scheduleRestart(computeBackoffMs(1));
-```
-
-}, watchdogIntervalMs).unref();
-
-function shutdown(reason) {
-console.log(”[railway-start] shutdown:”, reason);
-const child = claw;
-claw = null;
-if (child) killChild(child);
-// Fix #7: Extend shutdown delay to 3.5s so SIGKILL (at 2.5s) fires before process.exit
-setTimeout(() => process.exit(0), 3500);
-}
-
-process.on(“SIGTERM”, () => shutdown(“SIGTERM”));
-process.on(“SIGINT”, () => shutdown(“SIGINT”));
-process.on(“uncaughtException”, (e) => {
-console.error(”[railway-start] uncaughtException:”, e?.stack || e);
-shutdown(“uncaughtException”);
-});
-process.on(“unhandledRejection”, (e) => {
-console.error(”[railway-start] unhandledRejection:”, e?.stack || e);
-shutdown(“unhandledRejection”);
-});
-
-// Fix #9: Remove .unref() so this keepalive interval actually keeps the process alive
-setInterval(() => {}, 1 << 30);
-} else {
-const server = http.createServer(async (req, res) => {
-const url = req.url || “/”;
-
-```
-if (
-  enforceProxyToken &&
-  url !== "/health" &&
-  url !== "/ready" &&
-  url !== "/debug" &&
-  !isPublicUiPath(url)
-) {
-  const check = checkProxyToken(req);
-  if (!check.ok) return serveText(res, 401, "unauthorized");
-}
-
-if (url === "/health") return serveText(res, 200, "ok");
-
-if (url === "/ready") {
-  const ok = await isOpenClawReadyFast();
-  return serveText(res, ok ? 200 : 503, ok ? "ready" : "not-ready");
-}
-
-if (url === "/debug") {
-  const sig = await isOpenClawReadySignal();
-  const tfp = tokenFingerprint(token);
-
-  return serveJson(res, 200, {
-    externalPort,
-    internalPort,
-    proxyEnabled,
-    openclawListenOnExternal,
-    upstreamProtocol,
-    upstreamHost,
-    upstreamHostHeaderOverride,
-
-    clawReady,
-    clawRunning: !!claw,
-    clawPid: claw?.pid || null,
-
-    readyMode: readyCheckMode,
-    readyPath,
-    readyFallbackPaths,
-    readyExpect: readyExpectRaw,
-    readyOk: sig.ok,
-    readyDetail: sig.detail,
-
-    stateDir,
-
-    enforceTokenAuth,
-    injectGatewayTokenHeaders,
-    passGatewayTokenToChild,
-
-    autoPassTokenOnAuthError,
-
-    enforceProxyToken,
-    selfSanitize,
-
-    tokenFingerprint: tfp,
-
-    startupTimeoutMs,
-    watchdogIntervalMs,
-    proxyTimeoutMs,
-
-    restartAttempt,
-    restartScheduled,
-    clawStarting,
-
-    bindPrimary,
-    bindFallback,
-
-    OPENCLAW_SHELL_LOCAL_BIN: useShellForLocalBin,
-    OPENCLAW_FORCE: forceRequested,
-    OPENCLAW_FORCE_ENABLED: forceEnabled,
-    OPENCLAW_NO_DOCTOR: noDoctorEnabled,
-
-    trustedProxies: trusted,
-    outTail: outRing.slice(-120),
-    errTail: errRing.slice(-120),
-  });
-}
-
-if (!claw && !clawStarting) {
-  setTimeout(() => startOpenClawLoop(), 0);
-}
-
-if (!proxyEnabled) {
-  return serveText(res, 404, "Proxy disabled. Use /health /ready /debug.");
-}
-
-const isReady = await isOpenClawReadyFast();
-if (!isReady) return serveText(res, 503, "OpenClaw is not ready yet. Check /debug.");
-
-requestUpstream(req, res);
-```
-
-});
-
-// Avoid timeouts killing long-lived requests and websocket upgrades
-server.requestTimeout = 0;
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 70000; // Must be strictly > keepAliveTimeout to avoid Node warnings
-
-server.on(“error”, (e) => {
-console.error(”[railway-start] server error:”, e?.stack || e);
-});
-
-// Avoid process crash from malformed HTTP
-server.on(“clientError”, (err, socket) => {
-try {
-if (socket && socket.writable) {
-socket.end(“HTTP/1.1 400 Bad Request\r\n\r\n”);
-}
-} catch {}
-try {
-socket.destroy();
-} catch {}
-});
-
-// WebSocket upgrade proxy
-server.on(“upgrade”, async (req, socket, head) => {
-try {
-const url = req.url || “/”;
-
-```
-  if (enforceProxyToken && url !== "/debug" && !isPublicUiPath(url)) {
-    const check = checkProxyToken(req);
-    if (!check.ok) {
-      try {
-        socket.destroy();
-      } catch {}
-      return;
-    }
-  }
-
-  if (!proxyEnabled) {
-    try {
-      socket.destroy();
-    } catch {}
-    return;
-  }
-
-  const isReady = await isOpenClawReadyFast();
-  if (!isReady) {
-    try {
-      socket.destroy();
-    } catch {}
-    return;
-  }
-
-  // Fix #6: buildForwardedHeaders already calls applyGatewayTokenToHeaders internally
+  const url = req.url || "/";
   const headers = buildForwardedHeaders(req);
 
   const client = selectUpstreamClient();
@@ -1594,11 +1323,7 @@ const url = req.url || “/”;
     port: internalPort,
     method: req.method,
     path: url,
-    headers: {
-      ...headers,
-      connection: "Upgrade",
-      upgrade: "websocket",
-    },
+    headers,
     timeout: proxyTimeoutMs,
   };
 
@@ -1606,41 +1331,330 @@ const url = req.url || “/”;
     options.rejectUnauthorized = !upstreamInsecure;
   }
 
-  const upstreamReq = client.request(options);
+  const proxyReq = client.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
 
-  // If upstream returns a normal HTTP response (not an upgrade), relay it and close.
-  upstreamReq.on("response", (upstreamRes) => {
+  proxyReq.on("timeout", () => {
     try {
-      const statusCode = upstreamRes.statusCode || 502;
-      const statusMsg = upstreamRes.statusMessage || "";
-      const lines = [
-        `HTTP/${upstreamRes.httpVersion || "1.1"} ${statusCode} ${statusMsg}`.trim(),
-        ...headersToLines(upstreamRes.headers),
-        "",
-        "",
-      ];
-      socket.write(lines.join("\r\n"));
+      proxyReq.destroy(new Error("upstream timeout"));
+    } catch {}
+  });
 
-      upstreamRes.on("data", (chunk) => {
+  proxyReq.on("error", (err) => {
+    console.log("[railway-start] Proxy error:", err?.message || err);
+    serveText(res, 502, `Bad gateway: ${err?.message || err}. Check /debug.`);
+  });
+
+  req.pipe(proxyReq);
+}
+
+// If OpenClaw binds to externalPort, do not start wrapper server (port collision).
+if (openclawListenOnExternal) {
+  console.log("[railway-start] OPENCLAW_LISTEN_ON_EXTERNAL=1");
+  console.log("[railway-start] wrapper HTTP server disabled to avoid EADDRINUSE");
+  console.log("[railway-start] OpenClaw should serve /health /ready or its own endpoints");
+  console.log("[railway-start] bind mode forced to lan in this mode");
+
+  setTimeout(() => startOpenClawLoop(), 0);
+
+  setInterval(async () => {
+    if (!claw || clawStarting) return;
+    const ok = await isOpenClawReadyFast();
+    if (ok) return;
+
+    console.error("[railway-start] watchdog: OpenClaw not ready, restarting");
+    dumpRing("[railway-start][openclaw STDOUT]", outRing);
+    dumpRing("[railway-start][openclaw STDERR]", errRing);
+
+    const child = claw;
+    claw = null;
+    clawReady = false;
+    killChild(child);
+
+    restartAttempt = Math.max(1, restartAttempt);
+    scheduleRestart(computeBackoffMs(1));
+  }, watchdogIntervalMs).unref();
+
+  function shutdown(reason) {
+    console.log("[railway-start] shutdown:", reason);
+    const child = claw;
+    claw = null;
+    if (child) killChild(child);
+    setTimeout(() => process.exit(0), 3500);
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("uncaughtException", (e) => {
+    console.error("[railway-start] uncaughtException:", e?.stack || e);
+    shutdown("uncaughtException");
+  });
+  process.on("unhandledRejection", (e) => {
+    console.error("[railway-start] unhandledRejection:", e?.stack || e);
+    shutdown("unhandledRejection");
+  });
+
+  setInterval(() => {}, 1 << 30);
+} else {
+  const server = http.createServer(async (req, res) => {
+    const url = req.url || "/";
+
+    if (
+      enforceProxyToken &&
+      url !== "/health" &&
+      url !== "/ready" &&
+      url !== "/debug" &&
+      !isPublicUiPath(url)
+    ) {
+      const check = checkProxyToken(req);
+      if (!check.ok) return serveText(res, 401, "unauthorized");
+    }
+
+    if (url === "/health") return serveText(res, 200, "ok");
+
+    if (url === "/ready") {
+      const ok = await isOpenClawReadyFast();
+      return serveText(res, ok ? 200 : 503, ok ? "ready" : "not-ready");
+    }
+
+    if (url === "/debug") {
+      const sig = await isOpenClawReadySignal();
+      const tfp = tokenFingerprint(token);
+
+      return serveJson(res, 200, {
+        externalPort,
+        internalPort,
+        proxyEnabled,
+        openclawListenOnExternal,
+        upstreamProtocol,
+        upstreamHost,
+        upstreamHostHeaderOverride,
+
+        clawReady,
+        clawRunning: !!claw,
+        clawPid: claw?.pid || null,
+
+        readyMode: readyCheckMode,
+        readyPath,
+        readyFallbackPaths,
+        readyExpect: readyExpectRaw,
+        readyOk: sig.ok,
+        readyDetail: sig.detail,
+
+        stateDir,
+
+        enforceTokenAuth,
+        injectGatewayTokenHeaders,
+        passGatewayTokenToChild,
+
+        autoPassTokenOnAuthError,
+
+        enforceProxyToken,
+        selfSanitize,
+
+        tokenFingerprint: tfp,
+
+        startupTimeoutMs,
+        watchdogIntervalMs,
+        proxyTimeoutMs,
+
+        restartAttempt,
+        restartScheduled,
+        clawStarting,
+
+        bindPrimary,
+        bindFallback,
+
+        OPENCLAW_SHELL_LOCAL_BIN: useShellForLocalBin,
+        OPENCLAW_FORCE: forceRequested,
+        OPENCLAW_FORCE_ENABLED: forceEnabled,
+        OPENCLAW_NO_DOCTOR: noDoctorEnabled,
+
+        trustedProxies: trusted,
+        outTail: outRing.slice(-120),
+        errTail: errRing.slice(-120),
+      });
+    }
+
+    if (!claw && !clawStarting) {
+      setTimeout(() => startOpenClawLoop(), 0);
+    }
+
+    if (!proxyEnabled) {
+      return serveText(res, 404, "Proxy disabled. Use /health /ready /debug.");
+    }
+
+    const isReady = await isOpenClawReadyFast();
+    if (!isReady) return serveText(res, 503, "OpenClaw is not ready yet. Check /debug.");
+
+    requestUpstream(req, res);
+  });
+
+  // Avoid timeouts killing long-lived requests and websocket upgrades
+  server.requestTimeout = 0;
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 70000; // Must be strictly > keepAliveTimeout to avoid Node warnings
+
+  server.on("error", (e) => {
+    console.error("[railway-start] server error:", e?.stack || e);
+  });
+
+  // Avoid process crash from malformed HTTP
+  server.on("clientError", (err, socket) => {
+    try {
+      if (socket && socket.writable) {
+        socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+      }
+    } catch {}
+    try {
+      socket.destroy();
+    } catch {}
+  });
+
+  // WebSocket upgrade proxy
+  server.on("upgrade", async (req, socket, head) => {
+    try {
+      const url = req.url || "/";
+
+      if (enforceProxyToken && url !== "/debug" && !isPublicUiPath(url)) {
+        const check = checkProxyToken(req);
+        if (!check.ok) {
+          try {
+            socket.destroy();
+          } catch {}
+          return;
+        }
+      }
+
+      if (!proxyEnabled) {
         try {
-          socket.write(chunk);
+          socket.destroy();
         } catch {}
+        return;
+      }
+
+      const isReady = await isOpenClawReadyFast();
+      if (!isReady) {
+        try {
+          socket.destroy();
+        } catch {}
+        return;
+      }
+
+      const headers = buildForwardedHeaders(req);
+
+      const client = selectUpstreamClient();
+      const agent = selectUpstreamAgent();
+
+      const options = {
+        agent,
+        hostname: upstreamHost,
+        port: internalPort,
+        method: req.method,
+        path: url,
+        headers: {
+          ...headers,
+          connection: "Upgrade",
+          upgrade: "websocket",
+        },
+        timeout: proxyTimeoutMs,
+      };
+
+      if (upstreamProtocol === "https") {
+        options.rejectUnauthorized = !upstreamInsecure;
+      }
+
+      const upstreamReq = client.request(options);
+
+      // If upstream returns a normal HTTP response (not an upgrade), relay it and close.
+      upstreamReq.on("response", (upstreamRes) => {
+        try {
+          const statusCode = upstreamRes.statusCode || 502;
+          const statusMsg = upstreamRes.statusMessage || "";
+          const lines = [
+            `HTTP/${upstreamRes.httpVersion || "1.1"} ${statusCode} ${statusMsg}`.trim(),
+            ...headersToLines(upstreamRes.headers),
+            "",
+            "",
+          ];
+          socket.write(lines.join("\r\n"));
+
+          upstreamRes.on("data", (chunk) => {
+            try {
+              socket.write(chunk);
+            } catch {}
+          });
+
+          upstreamRes.on("end", () => {
+            try {
+              socket.end();
+            } catch {}
+            try {
+              socket.destroy();
+            } catch {}
+          });
+
+          upstreamRes.on("error", () => {
+            try {
+              socket.destroy();
+            } catch {}
+          });
+        } catch {
+          try {
+            socket.destroy();
+          } catch {}
+        }
       });
 
-      upstreamRes.on("end", () => {
+      upstreamReq.on("upgrade", (upstreamRes, upstreamSocket) => {
+        const lines = [
+          `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage || ""}`.trim(),
+          ...headersToLines(upstreamRes.headers),
+          "",
+          "",
+        ];
+        socket.write(lines.join("\r\n"));
+
+        // Forward any buffered client data (head) into upstream BEFORE piping
+        if (head && head.length) {
+          try {
+            upstreamSocket.write(head);
+          } catch {}
+        }
+
+        socket.pipe(upstreamSocket).pipe(socket);
+
+        socket.on("error", () => {
+          try {
+            upstreamSocket.destroy();
+          } catch {}
+        });
+
+        upstreamSocket.on("error", () => {
+          try {
+            socket.destroy();
+          } catch {}
+        });
+      });
+
+      upstreamReq.on("timeout", () => {
         try {
-          socket.end();
+          upstreamReq.destroy(new Error("upstream timeout"));
         } catch {}
         try {
           socket.destroy();
         } catch {}
       });
 
-      upstreamRes.on("error", () => {
+      upstreamReq.on("error", () => {
         try {
           socket.destroy();
         } catch {}
       });
+
+      upstreamReq.end();
     } catch {
       try {
         socket.destroy();
@@ -1648,119 +1662,57 @@ const url = req.url || “/”;
     }
   });
 
-  upstreamReq.on("upgrade", (upstreamRes, upstreamSocket) => {
-    const lines = [
-      `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${
-        upstreamRes.statusMessage || ""
-      }`.trim(),
-      ...headersToLines(upstreamRes.headers),
-      "",
-      "",
-    ];
-    socket.write(lines.join("\r\n"));
-
-    // Forward any buffered client data (head) into upstream BEFORE piping
-    if (head && head.length) {
-      try {
-        upstreamSocket.write(head);
-      } catch {}
+  server.listen(externalPort, "0.0.0.0", () => {
+    console.log("[railway-start] public server listening on 0.0.0.0:" + externalPort);
+    console.log("[railway-start] endpoints: /health /ready /debug");
+    console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
+    if (proxyEnabled) {
+      console.log(
+        "[railway-start] proxying other routes to",
+        `${upstreamProtocol}://${upstreamHost}:${internalPort}`
+      );
     }
 
-    socket.pipe(upstreamSocket).pipe(socket);
+    setTimeout(() => startOpenClawLoop(), 400);
 
-    socket.on("error", () => {
-      try {
-        upstreamSocket.destroy();
-      } catch {}
-    });
+    setInterval(async () => {
+      if (!claw || clawStarting) return;
+      const ok = await isOpenClawReadyFast();
+      if (ok) return;
 
-    upstreamSocket.on("error", () => {
-      try {
-        socket.destroy();
-      } catch {}
-    });
+      console.error("[railway-start] watchdog: OpenClaw not ready, restarting");
+      dumpRing("[railway-start][openclaw STDOUT]", outRing);
+      dumpRing("[railway-start][openclaw STDERR]", errRing);
+
+      const child = claw;
+      claw = null;
+      clawReady = false;
+      killChild(child);
+
+      restartAttempt = Math.max(1, restartAttempt);
+      scheduleRestart(computeBackoffMs(1));
+    }, watchdogIntervalMs).unref();
   });
 
-  upstreamReq.on("timeout", () => {
+  function shutdown(reason) {
+    console.log("[railway-start] shutdown:", reason);
     try {
-      upstreamReq.destroy(new Error("upstream timeout"));
+      server.close();
     } catch {}
-    try {
-      socket.destroy();
-    } catch {}
+    const child = claw;
+    claw = null;
+    if (child) killChild(child);
+    setTimeout(() => process.exit(0), 3500);
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("uncaughtException", (e) => {
+    console.error("[railway-start] uncaughtException:", e?.stack || e);
+    shutdown("uncaughtException");
   });
-
-  upstreamReq.on("error", () => {
-    try {
-      socket.destroy();
-    } catch {}
+  process.on("unhandledRejection", (e) => {
+    console.error("[railway-start] unhandledRejection:", e?.stack || e);
+    shutdown("unhandledRejection");
   });
-
-  upstreamReq.end();
-} catch {
-  try {
-    socket.destroy();
-  } catch {}
-}
-```
-
-});
-
-server.listen(externalPort, “0.0.0.0”, () => {
-console.log(”[railway-start] public server listening on 0.0.0.0:” + externalPort);
-console.log(”[railway-start] endpoints: /health /ready /debug”);
-console.log(”[railway-start] proxyEnabled =”, proxyEnabled ? “yes” : “no”);
-if (proxyEnabled) {
-console.log(
-“[railway-start] proxying other routes to”,
-`${upstreamProtocol}://${upstreamHost}:${internalPort}`
-);
-}
-
-```
-setTimeout(() => startOpenClawLoop(), 400);
-
-setInterval(async () => {
-  if (!claw || clawStarting) return;
-  const ok = await isOpenClawReadyFast();
-  if (ok) return;
-
-  console.error("[railway-start] watchdog: OpenClaw not ready, restarting");
-  dumpRing("[railway-start][openclaw STDOUT]", outRing);
-  dumpRing("[railway-start][openclaw STDERR]", errRing);
-
-  const child = claw;
-  claw = null;
-  clawReady = false;
-  killChild(child);
-
-  restartAttempt = Math.max(1, restartAttempt);
-  scheduleRestart(computeBackoffMs(1));
-}, watchdogIntervalMs).unref();
-```
-
-});
-
-function shutdown(reason) {
-console.log(”[railway-start] shutdown:”, reason);
-try {
-server.close();
-} catch {}
-const child = claw;
-claw = null;
-if (child) killChild(child);
-// Fix #7: Extend shutdown delay to 3.5s so SIGKILL (at 2.5s) fires before process.exit
-setTimeout(() => process.exit(0), 3500);
-}
-
-process.on(“SIGTERM”, () => shutdown(“SIGTERM”));
-process.on(“SIGINT”, () => shutdown(“SIGINT”));
-process.on(“uncaughtException”, (e) => {
-console.error(”[railway-start] uncaughtException:”, e?.stack || e);
-shutdown(“uncaughtException”);
-});
-process.on(“unhandledRejection”, (e) => {
-console.error(”[railway-start] unhandledRejection:”, e?.stack || e);
-shutdown(“unhandledRejection”);
-});
 }
