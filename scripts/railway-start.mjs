@@ -38,9 +38,13 @@
 //   The wrapper can still use the token for proxy-level auth if OPENCLAW_PROXY_ENFORCE_TOKEN=1.
 // - /debug now includes a token fingerprint (hash prefix + length) without revealing the token.
 //
-// Fix in this update (your crash):
-// - Removed duplicate `let claw = null;` (and related state vars) which caused:
-//   SyntaxError: Identifier 'claw' has already been declared
+// Fixes in this update (based on your logs)
+// - Ensures the child receives the token when needed:
+//   - passGatewayTokenToChild is now mutable (let), so we can auto-heal.
+//   - When passing token to child, we also pass CLI args: --token <token>.
+//   - Auto-heal: if OpenClaw logs "Gateway auth is set to token, but no token is configured",
+//     we flip passGatewayTokenToChild to true for the next restart.
+//   - Control auto-heal with OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR=0 to disable.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -335,9 +339,12 @@ const internalPort = openclawListenOnExternal ? externalPort : internalPortDefau
 const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
+// Auto-heal when OpenClaw complains auth token missing
+const autoPassTokenOnAuthError = envBool("OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR", true);
+
 // If token auth is not enforced, default to NOT passing OPENCLAW_GATEWAY_TOKEN into the child.
 // This prevents accidental "token_mismatch" loops when the UI has an old token stored.
-const passGatewayTokenToChild =
+let passGatewayTokenToChild =
   enforceTokenAuth || envBool("OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD", false);
 
 // Self sanitize config to a strict minimal object that cannot contain unknown keys.
@@ -423,6 +430,7 @@ console.log(
 );
 console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
 console.log("[railway-start] pass gateway token to child =", passGatewayTokenToChild ? "yes" : "no");
+console.log("[railway-start] autoPassTokenOnAuthError =", autoPassTokenOnAuthError ? "yes" : "no");
 console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" : "no");
 console.log("[railway-start] selfSanitize =", selfSanitize ? "yes" : "no");
 console.log("[railway-start] startupTimeoutMs =", startupTimeoutMs);
@@ -688,6 +696,11 @@ function buildOpenClawArgs(bindMode) {
     String(internalPort),
   ];
 
+  // If we pass token to the child, also pass via CLI (some builds prefer this).
+  if (passGatewayTokenToChild && token) {
+    args.push("--token", token);
+  }
+
   if (forceEnabled) {
     args.push("--force");
   } else if (forceRequested && !forceEnabled) {
@@ -703,6 +716,10 @@ function currentBindForAttempt(attempt) {
 
 function spawnOpenClawProcess(bindMode) {
   const childEnv = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+
+  if (passGatewayTokenToChild && token) {
+    childEnv.OPENCLAW_GATEWAY_TOKEN = token;
+  }
 
   // Prevent accidental token enforcement inside OpenClaw when you only want proxy-level token checks
   if (!passGatewayTokenToChild) {
@@ -934,9 +951,26 @@ async function startOpenClawLoop() {
         .split("\n")
         .map((x) => x.trimEnd())
         .filter(Boolean);
+
       for (const ln of lines) {
         pushRing(errRing, ln);
         console.error("[openclaw ERROR]", ln);
+
+        // Auto-heal: OpenClaw says auth token mode but token is missing
+        if (autoPassTokenOnAuthError && !passGatewayTokenToChild && token) {
+          const low = String(ln || "").toLowerCase();
+          const hit =
+            low.includes("gateway auth is set to token") &&
+            (low.includes("no token is configured") || low.includes("set gateway.auth.token"));
+
+          if (hit) {
+            passGatewayTokenToChild = true;
+            console.log(
+              "[railway-start] detected auth token missing; enabling passGatewayTokenToChild for next restart"
+            );
+          }
+        }
+
         markReadyFromLine(ln);
       }
     });
@@ -1315,6 +1349,8 @@ if (openclawListenOnExternal) {
 
         enforceTokenAuth,
         passGatewayTokenToChild,
+
+        autoPassTokenOnAuthError,
 
         enforceProxyToken,
         selfSanitize,
