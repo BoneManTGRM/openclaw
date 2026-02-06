@@ -19,6 +19,7 @@
 // 3) Tightens readiness and restart behavior (kills child on TCP-not-ready).
 // 4) Keeps selfSanitize behavior: strips proxy-derived headers and does not add x-forwarded-* back.
 // 5) Keeps OpenClaw bind logic: proxy mode prefers loopback, fallback to lan after failures.
+// 6) WebSocket proxy now handles non-101 upstream responses safely (no hanging sockets).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -267,6 +268,22 @@ function shQuoteArg(a) {
 
 function shJoin(cmd, args) {
   return [cmd, ...(args || [])].map(shQuoteArg).join(" ");
+}
+
+function headerValueToString(v) {
+  if (Array.isArray(v)) return v.map((x) => String(x)).join(", ");
+  if (v == null) return "";
+  return String(v);
+}
+
+function headersToLines(headers) {
+  const out = [];
+  for (const [k, v] of Object.entries(headers || {})) {
+    const sv = headerValueToString(v);
+    if (!sv) continue;
+    out.push(`${k}: ${sv}`);
+  }
+  return out;
 }
 
 // Railway port (public)
@@ -1252,10 +1269,50 @@ if (openclawListenOnExternal) {
 
       const upstreamReq = client.request(options);
 
+      // If upstream returns a normal HTTP response (not an upgrade), relay it and close.
+      upstreamReq.on("response", (upstreamRes) => {
+        try {
+          const statusCode = upstreamRes.statusCode || 502;
+          const statusMsg = upstreamRes.statusMessage || "";
+          const lines = [
+            `HTTP/${upstreamRes.httpVersion || "1.1"} ${statusCode} ${statusMsg}`.trim(),
+            ...headersToLines(upstreamRes.headers),
+            "",
+            "",
+          ];
+          socket.write(lines.join("\r\n"));
+
+          upstreamRes.on("data", (chunk) => {
+            try {
+              socket.write(chunk);
+            } catch {}
+          });
+
+          upstreamRes.on("end", () => {
+            try {
+              socket.end();
+            } catch {}
+            try {
+              socket.destroy();
+            } catch {}
+          });
+
+          upstreamRes.on("error", () => {
+            try {
+              socket.destroy();
+            } catch {}
+          });
+        } catch {
+          try {
+            socket.destroy();
+          } catch {}
+        }
+      });
+
       upstreamReq.on("upgrade", (upstreamRes, upstreamSocket) => {
         const lines = [
           `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage || ""}`.trim(),
-          ...Object.entries(upstreamRes.headers).map(([k, v]) => `${k}: ${v}`),
+          ...headersToLines(upstreamRes.headers),
           "",
           "",
         ];
@@ -1276,6 +1333,15 @@ if (openclawListenOnExternal) {
             socket.destroy();
           } catch {}
         });
+      });
+
+      upstreamReq.on("timeout", () => {
+        try {
+          upstreamReq.destroy(new Error("upstream timeout"));
+        } catch {}
+        try {
+          socket.destroy();
+        } catch {}
       });
 
       upstreamReq.on("error", () => {
