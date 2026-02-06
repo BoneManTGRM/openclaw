@@ -16,12 +16,20 @@
 // Key fixes in this version
 // 1) Host header parsing is IPv6 safe (handles [::1]:port correctly).
 // 2) Adds server "clientError" handler to avoid crashes on malformed requests.
-// 3) Tightens readiness and restart behavior (kills child on TCP-not-ready).
+// 3) Tightens readiness and restart behavior (kills child on not-ready).
 // 4) Keeps selfSanitize behavior: strips proxy-derived headers and does not add x-forwarded-* back.
 // 5) Keeps OpenClaw bind logic: proxy mode prefers loopback, fallback to lan after failures.
-// 6) WebSocket proxy now handles non-101 upstream responses safely (no hanging sockets).
+// 6) WebSocket proxy handles non-101 upstream responses safely (no hanging sockets).
 //
-// Update in this version
+// Updates in this version
+// - Adds an optional HTTP readiness check (default path /health) in addition to TCP.
+//   This reduces false positives where a port is open but the app is not serving yet.
+//   Controls:
+//   - OPENCLAW_READY_CHECK_MODE = "http" | "tcp" (default "http")
+//   - OPENCLAW_READY_PATH = "/health" (default "/health")
+//   - OPENCLAW_READY_EXPECT = "200" (default "200")
+//   - OPENCLAW_READY_TIMEOUT_MS = 1200 (default 1200)
+// - Watchdog uses the same readiness check for better signal.
 // - Do NOT write gateway.auth unless token auth is explicitly enabled.
 //   Some OpenClaw builds reject gateway.auth.mode or the "none" enum and will exit on boot.
 
@@ -319,6 +327,13 @@ startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
 const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
 const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
 
+// Readiness checks
+const readyCheckMode = envStr("OPENCLAW_READY_CHECK_MODE", "http").toLowerCase() === "tcp" ? "tcp" : "http";
+const readyPath = envStr("OPENCLAW_READY_PATH", "/health") || "/health";
+const readyExpect = String(envStr("OPENCLAW_READY_EXPECT", "200")).trim() || "200";
+let readyTimeoutMs = envInt("OPENCLAW_READY_TIMEOUT_MS", 1200);
+readyTimeoutMs = clamp(readyTimeoutMs, 250, 8000);
+
 // Upstream protocol for proxy mode
 const upstreamProtocol =
   envStr("OPENCLAW_UPSTREAM_PROTOCOL", "http").toLowerCase() === "https" ? "https" : "http";
@@ -386,6 +401,7 @@ console.log("[railway-start] OPENCLAW_SHELL_LOCAL_BIN =", useShellForLocalBin ? 
 console.log("[railway-start] OpenClaw force requested =", forceRequested ? "yes" : "no");
 console.log("[railway-start] OpenClaw force enabled =", forceEnabled ? "yes" : "no");
 console.log("[railway-start] upstream =", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
+console.log("[railway-start] readyCheckMode =", readyCheckMode, "readyPath =", readyPath, "readyExpect =", readyExpect);
 
 if (openclawListenOnExternal) {
   console.log("[railway-start] warning: OPENCLAW_LISTEN_ON_EXTERNAL=1 disables wrapper server");
@@ -415,7 +431,6 @@ function buildSanitizedConfig() {
   cfg.gateway.trustedProxies = trusted;
 
   // Only write auth settings if token auth is explicitly enabled.
-  // Some OpenClaw builds reject gateway.auth.mode and/or the "none" enum.
   if (enforceTokenAuth && token) {
     cfg.gateway.auth = { mode: "token", token };
     console.log("[railway-start] gateway auth enabled (token)");
@@ -449,7 +464,6 @@ function buildCompatConfig() {
   }
 
   // Only write auth settings if token auth is explicitly enabled.
-  // Some OpenClaw builds reject gateway.auth.mode and/or the "none" enum.
   if (enforceTokenAuth && token) {
     base.gateway.auth = base.gateway.auth || {};
     base.gateway.auth.mode = "token";
@@ -682,7 +696,69 @@ async function isPortReadyAnyHost() {
   return { ok: false, host: null };
 }
 
-async function waitForOpenClawTcpReady(timeoutMs, child) {
+function selectUpstreamClient() {
+  return upstreamProtocol === "https" ? https : http;
+}
+
+function selectUpstreamAgent() {
+  return upstreamProtocol === "https" ? proxyAgentHttps : proxyAgentHttp;
+}
+
+async function httpReadyCheckOnce() {
+  const client = selectUpstreamClient();
+  const agent = selectUpstreamAgent();
+  const insecure = envBool("OPENCLAW_UPSTREAM_INSECURE", false);
+
+  const options = {
+    agent,
+    hostname: upstreamHost,
+    port: internalPort,
+    method: "GET",
+    path: readyPath,
+    headers: {
+      host: upstreamHostHeaderOverride || buildLocalHostHeader(upstreamHost, internalPort),
+      accept: "text/plain,application/json",
+      "user-agent": "railway-start-readycheck",
+    },
+    timeout: readyTimeoutMs,
+  };
+
+  if (upstreamProtocol === "https") {
+    options.rejectUnauthorized = !insecure;
+  }
+
+  return new Promise((resolve) => {
+    const req = client.request(options, (res) => {
+      const code = String(res.statusCode || "");
+      res.resume();
+      resolve(code === readyExpect);
+    });
+    req.on("timeout", () => {
+      try {
+        req.destroy(new Error("ready timeout"));
+      } catch {}
+      resolve(false);
+    });
+    req.on("error", () => resolve(false));
+    req.end();
+  });
+}
+
+async function isOpenClawReadySignal() {
+  if (readyCheckMode === "tcp") {
+    const r = await isPortReadyAnyHost();
+    return { ok: r.ok, detail: r };
+  }
+
+  // http mode: require TCP first, then HTTP path
+  const r = await isPortReadyAnyHost();
+  if (!r.ok) return { ok: false, detail: r };
+
+  const okHttp = await httpReadyCheckOnce();
+  return { ok: okHttp, detail: { ...r, http: okHttp, path: readyPath, expect: readyExpect } };
+}
+
+async function waitForOpenClawReady(timeoutMs, child) {
   const start = Date.now();
   const deadline = start + timeoutMs;
 
@@ -696,9 +772,23 @@ async function waitForOpenClawTcpReady(timeoutMs, child) {
       return false;
     }
 
-    const r = await isPortReadyAnyHost();
-    if (r.ok) {
-      console.log("[railway-start] TCP ready on host", r.host, "port", internalPort);
+    const sig = await isOpenClawReadySignal();
+    if (sig.ok) {
+      if (readyCheckMode === "tcp") {
+        console.log("[railway-start] TCP ready on host", sig.detail.host, "port", internalPort);
+      } else {
+        console.log(
+          "[railway-start] ready via HTTP",
+          "host",
+          sig.detail.host,
+          "port",
+          internalPort,
+          "path",
+          readyPath,
+          "expect",
+          readyExpect
+        );
+      }
       return true;
     }
 
@@ -708,7 +798,9 @@ async function waitForOpenClawTcpReady(timeoutMs, child) {
       const elapsed = now - start;
       const remaining = Math.max(0, deadline - now);
       console.log(
-        "[railway-start] waiting for TCP readiness",
+        "[railway-start] waiting for readiness",
+        "mode",
+        readyCheckMode,
         "elapsed",
         elapsed,
         "ms",
@@ -847,7 +939,7 @@ async function startOpenClawLoop() {
     scheduleRestart(waitMs);
   });
 
-  const becameReady = await waitForOpenClawTcpReady(startupTimeoutMs, claw);
+  const becameReady = await waitForOpenClawReady(startupTimeoutMs, claw);
 
   if (myLoopId !== startLoopId) {
     clawStarting = false;
@@ -855,7 +947,7 @@ async function startOpenClawLoop() {
   }
 
   if (!becameReady) {
-    console.error("[railway-start] OpenClaw did not become TCP-ready in time, restarting");
+    console.error("[railway-start] OpenClaw did not become ready in time, restarting");
     dumpRing("[railway-start][openclaw STDOUT]", outRing);
     dumpRing("[railway-start][openclaw STDERR]", errRing);
 
@@ -874,7 +966,7 @@ async function startOpenClawLoop() {
   restartAttempt = 0;
   clawStarting = false;
   clawReady = true;
-  console.log("[railway-start] OpenClaw is TCP-ready");
+  console.log("[railway-start] OpenClaw is ready");
 }
 
 const proxyAgentHttp = new http.Agent({ keepAlive: true });
@@ -1022,8 +1114,8 @@ function buildForwardedHeaders(req) {
 
 async function isOpenClawReadyFast() {
   if (clawReady) return true;
-  const r = await isPortReadyAnyHost();
-  return r.ok;
+  const sig = await isOpenClawReadySignal();
+  return sig.ok;
 }
 
 function serveJson(res, code, obj) {
@@ -1036,14 +1128,6 @@ function serveText(res, code, text) {
   res.statusCode = code;
   res.setHeader("content-type", "text/plain");
   res.end(text);
-}
-
-function selectUpstreamClient() {
-  return upstreamProtocol === "https" ? https : http;
-}
-
-function selectUpstreamAgent() {
-  return upstreamProtocol === "https" ? proxyAgentHttps : proxyAgentHttp;
 }
 
 function requestUpstream(req, res) {
@@ -1100,10 +1184,10 @@ if (openclawListenOnExternal) {
 
   setInterval(async () => {
     if (!claw || clawStarting) return;
-    const r = await isPortReadyAnyHost();
-    if (r.ok) return;
+    const ok = await isOpenClawReadyFast();
+    if (ok) return;
 
-    console.error("[railway-start] watchdog: OpenClaw TCP down, restarting");
+    console.error("[railway-start] watchdog: OpenClaw not ready, restarting");
     dumpRing("[railway-start][openclaw STDOUT]", outRing);
     dumpRing("[railway-start][openclaw STDERR]", errRing);
 
@@ -1159,7 +1243,7 @@ if (openclawListenOnExternal) {
     }
 
     if (url === "/debug") {
-      const r = await isPortReadyAnyHost();
+      const sig = await isOpenClawReadySignal();
       return serveJson(res, 200, {
         externalPort,
         internalPort,
@@ -1171,8 +1255,11 @@ if (openclawListenOnExternal) {
         clawReady,
         clawRunning: !!claw,
         clawPid: claw?.pid || null,
-        tcpReady: r.ok,
-        tcpHost: r.host,
+        readyMode: readyCheckMode,
+        readyPath,
+        readyExpect,
+        readyOk: sig.ok,
+        readyDetail: sig.detail,
         stateDir,
         enforceTokenAuth,
         enforceProxyToken,
@@ -1212,6 +1299,10 @@ if (openclawListenOnExternal) {
   server.requestTimeout = 0;
   server.headersTimeout = Math.max(server.headersTimeout || 60000, 65000);
   server.keepAliveTimeout = Math.max(server.keepAliveTimeout || 5000, 65000);
+
+  server.on("error", (e) => {
+    console.error("[railway-start] server error:", e?.stack || e);
+  });
 
   // Avoid process crash from malformed HTTP
   server.on("clientError", (err, socket) => {
@@ -1385,10 +1476,10 @@ if (openclawListenOnExternal) {
 
     setInterval(async () => {
       if (!claw || clawStarting) return;
-      const r = await isPortReadyAnyHost();
-      if (r.ok) return;
+      const ok = await isOpenClawReadyFast();
+      if (ok) return;
 
-      console.error("[railway-start] watchdog: OpenClaw TCP down, restarting");
+      console.error("[railway-start] watchdog: OpenClaw not ready, restarting");
       dumpRing("[railway-start][openclaw STDOUT]", outRing);
       dumpRing("[railway-start][openclaw STDERR]", errRing);
 
