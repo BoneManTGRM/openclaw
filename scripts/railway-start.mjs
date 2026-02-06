@@ -49,6 +49,11 @@
 // - When OPENCLAW_ENFORCE_TOKEN_AUTH=1, browsers often cannot add the required WS header.
 // - This wrapper injects the gateway token into upstream HTTP and WS requests so the UI works.
 //   Control with OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS=0 to disable.
+//
+// Additional fixes in this update (hardening)
+// - Proxy HTTP request lifecycle: if client disconnects, upstream request is destroyed.
+// - WebSocket upgrade lifecycle: if either side closes, the other side is destroyed.
+// - WebSocket path: if upstream never upgrades and client closes early, upstream request is destroyed.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -1230,7 +1235,7 @@ function pickHostHeaderForUpstream(req, xfHost) {
     return buildLocalHostHeader(upstreamHost, internalPort);
   }
 
-  return xfHost || inboundHost || "";
+  return String(xfHost || inboundHost || "");
 }
 
 function buildForwardedHeaders(req) {
@@ -1253,7 +1258,11 @@ function buildForwardedHeaders(req) {
     (req.socket?.encrypted ? "https" : "http");
 
   const xfHost =
-    forwardedHostOverride || req.headers[H_XFH] || req.headers["x-forwarded-host"] || req.headers.host || "";
+    forwardedHostOverride ||
+    req.headers[H_XFH] ||
+    req.headers["x-forwarded-host"] ||
+    req.headers.host ||
+    "";
 
   const hopByHop = new Set([
     "connection",
@@ -1336,6 +1345,15 @@ function requestUpstream(req, res) {
     proxyRes.pipe(res);
   });
 
+  // If the client goes away, stop work upstream.
+  const abortUpstream = () => {
+    try {
+      proxyReq.destroy();
+    } catch {}
+  };
+  req.on("aborted", abortUpstream);
+  res.on("close", abortUpstream);
+
   proxyReq.on("timeout", () => {
     try {
       proxyReq.destroy(new Error("upstream timeout"));
@@ -1344,7 +1362,13 @@ function requestUpstream(req, res) {
 
   proxyReq.on("error", (err) => {
     console.log("[railway-start] Proxy error:", err?.message || err);
-    serveText(res, 502, `Bad gateway: ${err?.message || err}. Check /debug.`);
+    if (!res.headersSent) {
+      serveText(res, 502, `Bad gateway: ${err?.message || err}. Check /debug.`);
+    } else {
+      try {
+        res.end();
+      } catch {}
+    }
   });
 
   req.pipe(proxyReq);
@@ -1515,33 +1539,33 @@ if (openclawListenOnExternal) {
 
   // WebSocket upgrade proxy
   server.on("upgrade", async (req, socket, head) => {
+    let upstreamReq = null;
+    let upstreamSocket = null;
+
+    const destroyBoth = () => {
+      try {
+        if (upstreamReq) upstreamReq.destroy();
+      } catch {}
+      try {
+        if (upstreamSocket) upstreamSocket.destroy();
+      } catch {}
+      try {
+        socket.destroy();
+      } catch {}
+    };
+
     try {
       const url = req.url || "/";
 
       if (enforceProxyToken && url !== "/debug" && !isPublicUiPath(url)) {
         const check = checkProxyToken(req);
-        if (!check.ok) {
-          try {
-            socket.destroy();
-          } catch {}
-          return;
-        }
+        if (!check.ok) return destroyBoth();
       }
 
-      if (!proxyEnabled) {
-        try {
-          socket.destroy();
-        } catch {}
-        return;
-      }
+      if (!proxyEnabled) return destroyBoth();
 
       const isReady = await isOpenClawReadyFast();
-      if (!isReady) {
-        try {
-          socket.destroy();
-        } catch {}
-        return;
-      }
+      if (!isReady) return destroyBoth();
 
       const headers = buildForwardedHeaders(req);
 
@@ -1566,7 +1590,10 @@ if (openclawListenOnExternal) {
         options.rejectUnauthorized = !upstreamInsecure;
       }
 
-      const upstreamReq = client.request(options);
+      upstreamReq = client.request(options);
+
+      socket.on("error", destroyBoth);
+      socket.on("close", destroyBoth);
 
       // If upstream returns a normal HTTP response (not an upgrade), relay it and close.
       upstreamReq.on("response", (upstreamRes) => {
@@ -1591,24 +1618,18 @@ if (openclawListenOnExternal) {
             try {
               socket.end();
             } catch {}
-            try {
-              socket.destroy();
-            } catch {}
+            destroyBoth();
           });
 
-          upstreamRes.on("error", () => {
-            try {
-              socket.destroy();
-            } catch {}
-          });
+          upstreamRes.on("error", destroyBoth);
         } catch {
-          try {
-            socket.destroy();
-          } catch {}
+          destroyBoth();
         }
       });
 
-      upstreamReq.on("upgrade", (upstreamRes, upstreamSocket) => {
+      upstreamReq.on("upgrade", (upstreamRes, us, uHead) => {
+        upstreamSocket = us;
+
         const lines = [
           `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage || ""}`.trim(),
           ...headersToLines(upstreamRes.headers),
@@ -1617,48 +1638,32 @@ if (openclawListenOnExternal) {
         ];
         socket.write(lines.join("\r\n"));
 
-        // Forward any buffered client data (head) into upstream BEFORE piping
+        // Forward any buffered data (head) into upstream before piping
         if (head && head.length) {
           try {
             upstreamSocket.write(head);
           } catch {}
         }
 
+        // Also forward any buffered upstream head if present
+        if (uHead && uHead.length) {
+          try {
+            socket.write(uHead);
+          } catch {}
+        }
+
+        upstreamSocket.on("error", destroyBoth);
+        upstreamSocket.on("close", destroyBoth);
+
         socket.pipe(upstreamSocket).pipe(socket);
-
-        socket.on("error", () => {
-          try {
-            upstreamSocket.destroy();
-          } catch {}
-        });
-
-        upstreamSocket.on("error", () => {
-          try {
-            socket.destroy();
-          } catch {}
-        });
       });
 
-      upstreamReq.on("timeout", () => {
-        try {
-          upstreamReq.destroy(new Error("upstream timeout"));
-        } catch {}
-        try {
-          socket.destroy();
-        } catch {}
-      });
-
-      upstreamReq.on("error", () => {
-        try {
-          socket.destroy();
-        } catch {}
-      });
+      upstreamReq.on("timeout", () => destroyBoth());
+      upstreamReq.on("error", () => destroyBoth());
 
       upstreamReq.end();
     } catch {
-      try {
-        socket.destroy();
-      } catch {}
+      destroyBoth();
     }
   });
 
