@@ -60,6 +60,13 @@
 // New env toggle (default ON):
 //   OPENCLAW_WS_STRIP_PROXY_HEADERS=1
 // This strips x-forwarded-* and related proxy-derived headers ONLY for WS upgrades.
+//
+// PATCHES APPLIED IN THIS UPDATE (relative to the file you pasted)
+// - Host header fallback: if inbound Host is missing, always set a safe local Host for upstream
+// - WS Host fallback: ensure WS upgrade also always has a Host header (some iOS edge cases)
+//
+// Additional hardening in this revision
+// - Ensure upstream sockets also get setNoDelay + keepAlive early via request "socket" events
 
 import fs from "node:fs";
 import path from "node:path";
@@ -148,8 +155,6 @@ function canWriteDir(dir) {
 }
 
 function parseTrustedProxies() {
-  // If you want to fully trust proxy headers for debugging only.
-  // This is NOT recommended for public deployments.
   const trustAll = envBool("OPENCLAW_TRUST_ALL_PROXIES", false);
   if (trustAll) {
     return ["0.0.0.0/0", "::/0"];
@@ -157,7 +162,6 @@ function parseTrustedProxies() {
 
   const override = String(process.env.OPENCLAW_TRUSTED_PROXIES || "").trim();
 
-  // Include both CIDR and plain IP forms to survive parser differences across builds.
   const base = [
     "100.64.0.0/10",
     "10.0.0.0/8",
@@ -275,7 +279,6 @@ function buildLocalHostHeader(hostForUpstream, portForUpstream) {
 }
 
 // Basic shell-style split with quotes, for OPENCLAW_CMD only.
-// Supports: spaces, single quotes, double quotes, backslash escapes inside double quotes.
 function shellSplit(cmdline) {
   const s = String(cmdline || "").trim();
   if (!s) return [];
@@ -414,7 +417,6 @@ const externalPort = envInt("PORT", 8080);
 const internalPortDefault = envInt("OPENCLAW_INTERNAL_PORT", 8081);
 
 // If OPENCLAW_LISTEN_ON_EXTERNAL=1, OpenClaw binds to externalPort.
-// In that mode this wrapper MUST NOT bind to externalPort.
 const openclawListenOnExternal = envBool("OPENCLAW_LISTEN_ON_EXTERNAL", false);
 
 const internalPort = openclawListenOnExternal ? externalPort : internalPortDefault;
@@ -424,7 +426,7 @@ const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 // Token auth requested
 let enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
-// Inject gateway token into upstream requests (fixes token_mismatch for Control UI)
+// Inject gateway token into upstream requests
 let injectGatewayTokenHeaders = envBool("OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS", true);
 
 // Auto-heal when OpenClaw complains auth token missing
@@ -435,7 +437,6 @@ let passGatewayTokenToChild =
   enforceTokenAuth || envBool("OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD", false);
 
 // Safety: if enforceTokenAuth was requested but token is missing, disable it
-// and recompute passGatewayTokenToChild so it is not stuck true.
 if (enforceTokenAuth && !token) {
   enforceTokenAuth = false;
   console.log(
@@ -487,10 +488,9 @@ const forwardedHostOverride = envStr("OPENCLAW_FORWARDED_HOST", "");
 const upstreamHostHeaderOverride = envStr("OPENCLAW_UPSTREAM_HOST_HEADER", "");
 
 // If true, rewrite Host to local loopback when upstreamHost is loopback.
-// Default is false because it can cause ws to show host=127.0.0.1:8081 and some clients bail.
 const upstreamForceLocalHostHeader = envBool("OPENCLAW_UPSTREAM_FORCE_LOCAL_HOST", false);
 
-// WS: strip proxy-derived headers on upgrade (default ON) to prevent OpenClaw proxy detection loops.
+// WS: strip proxy-derived headers on upgrade (default ON)
 const wsStripProxyHeaders = envBool("OPENCLAW_WS_STRIP_PROXY_HEADERS", true);
 
 // OpenClaw expects bind MODEs here, not IPs.
@@ -614,7 +614,6 @@ function buildSanitizedConfig() {
   ]);
   cfg.gateway.trustedProxies = trusted;
 
-  // Only write auth settings if token auth is explicitly enabled.
   if (enforceTokenAuth && token) {
     cfg.gateway.auth = { mode: "token", token };
     console.log("[railway-start] gateway auth enabled (token)");
@@ -638,7 +637,6 @@ function buildCompatConfig() {
   ]);
   base.gateway.trustedProxies = trusted;
 
-  // Strip known-invalid keys
   delete base.trustProxy;
   delete base.trustedProxies;
   if (base.gateway) {
@@ -647,7 +645,6 @@ function buildCompatConfig() {
     delete base.gateway.pairingRequired;
   }
 
-  // Only write auth settings if token auth is explicitly enabled.
   if (enforceTokenAuth && token) {
     base.gateway.auth = base.gateway.auth || {};
     base.gateway.auth.mode = "token";
@@ -830,7 +827,6 @@ function buildOpenClawArgs(bindMode) {
     args.push("--allow-unconfigured");
   }
 
-  // If we pass token to the child, also pass via CLI (some builds prefer this).
   if (passGatewayTokenToChild) {
     if (token) {
       args.push("--token", token);
@@ -865,7 +861,6 @@ function spawnOpenClawProcess(bindMode) {
     childEnv.OPENCLAW_GATEWAY_TOKEN = token;
   }
 
-  // Prevent accidental token enforcement inside OpenClaw when you only want proxy-level token checks
   if (!passGatewayTokenToChild) {
     delete childEnv.OPENCLAW_GATEWAY_TOKEN;
     delete childEnv.OPENCLAW_ENFORCE_TOKEN_AUTH;
@@ -923,8 +918,6 @@ function selectUpstreamAgent() {
   return upstreamProtocol === "https" ? proxyAgentHttps : proxyAgentHttp;
 }
 
-// IMPORTANT: inject token when the upstream is actually using token auth.
-// That is true if either enforceTokenAuth is on OR the child is receiving the token.
 function shouldInjectGatewayToken() {
   if (!token) return false;
   if (!injectGatewayTokenHeaders) return false;
@@ -937,7 +930,6 @@ function applyGatewayTokenToHeaders(headers) {
   if (!shouldInjectGatewayToken()) return headers;
   const h = { ...(headers || {}) };
 
-  // Reduced exposure surface while keeping compatibility.
   h["x-openclaw-token"] = token;
   h["authorization"] = `Bearer ${token}`;
 
@@ -1127,7 +1119,6 @@ function isPublicUiPath(url) {
   return false;
 }
 
-// Headers that trigger OpenClaw proxy detection and can cause pairing loops behind Railway.
 const PROXY_DERIVED_HEADERS = new Set([
   "forwarded",
   "x-forwarded-for",
@@ -1161,15 +1152,17 @@ function pickHostHeaderForUpstream(req, xfHost) {
   if (upstreamHostHeaderOverride) return upstreamHostHeaderOverride;
 
   const inboundHost = req.headers?.host || "";
-  const candidate = String(xfHost || inboundHost || "");
+  const candidate = String(xfHost || inboundHost || "").trim();
 
-  // Default behavior: keep the external host so OpenClaw sees the correct host/origin.
-  // Old behavior (rewrite to local) is available via OPENCLAW_UPSTREAM_FORCE_LOCAL_HOST=1.
+  // PATCH: if missing, always provide a safe Host header to upstream
+  if (!candidate) {
+    return buildLocalHostHeader(upstreamHost, internalPort);
+  }
+
   if (!upstreamForceLocalHostHeader) {
     return candidate;
   }
 
-  // Optional legacy behavior
   const inboundIsLocal = isLocalHostHeader(inboundHost);
   if (isLoopbackHost(upstreamHost) && !inboundIsLocal) {
     return buildLocalHostHeader(upstreamHost, internalPort);
@@ -1239,7 +1232,6 @@ function buildForwardedHeaders(req, opts = {}) {
     if (!HOP_BY_HOP.has(String(k).toLowerCase())) cleaned[k] = v;
   }
 
-  // Always remove "Forwarded:" header
   delete cleaned.forwarded;
 
   // Ensure upstream Host is correct
@@ -1248,7 +1240,11 @@ function buildForwardedHeaders(req, opts = {}) {
   // WS path: strip proxy-derived headers to prevent OpenClaw proxy detection warnings/loops.
   if (forWs && wsStripProxyHeaders) {
     const base = stripProxyDerivedHeaders(cleaned);
-    base.host = cleaned.host || base.host || "";
+
+    // PATCH: guarantee Host exists for WS upgrade too
+    base.host =
+      String(cleaned.host || base.host || "").trim() || buildLocalHostHeader(upstreamHost, internalPort);
+
     return applyGatewayTokenToHeaders(base);
   }
 
@@ -1259,10 +1255,9 @@ function buildForwardedHeaders(req, opts = {}) {
   else if (remoteAddr) xff = remoteAddr;
 
   if (selfSanitize) {
-    // In selfSanitize mode, do not forward arbitrary proxy-derived headers.
-    // Instead, rebuild a minimal, safe x-forwarded-* set so OpenClaw knows the external origin.
     const base = stripProxyDerivedHeaders(cleaned);
-    base.host = cleaned.host || base.host || "";
+    base.host =
+      String(cleaned.host || base.host || "").trim() || buildLocalHostHeader(upstreamHost, internalPort);
 
     const rebuilt = {
       ...base,
@@ -1350,6 +1345,13 @@ function requestUpstream(req, res) {
     });
 
     proxyRes.pipe(res);
+  });
+
+  proxyReq.on("socket", (s) => {
+    try {
+      s.setNoDelay(true);
+      s.setKeepAlive(true);
+    } catch {}
   });
 
   const abortUpstream = () => {
@@ -1830,12 +1832,10 @@ if (openclawListenOnExternal) {
     let upgraded = false;
     let closing = false;
 
-    // Pause immediately so early frames do not race the piping setup
     try {
       socket.pause();
     } catch {}
 
-    // Improve WS stability early for mobile clients
     try {
       socket.setNoDelay(true);
       socket.setTimeout(0);
@@ -1872,7 +1872,6 @@ if (openclawListenOnExternal) {
       const isReady = await isOpenClawReadyFast();
       if (!isReady) return destroyBoth("upstream not ready");
 
-      // IMPORTANT: for WS, strip x-forwarded-* (default) to prevent OpenClaw proxy detection.
       const headers = buildForwardedHeaders(req, { forWs: true });
 
       const client = selectUpstreamClient();
@@ -1896,6 +1895,14 @@ if (openclawListenOnExternal) {
       }
 
       upstreamReq = client.request(options);
+
+      upstreamReq.on("socket", (s) => {
+        try {
+          s.setNoDelay(true);
+          s.setTimeout(0);
+          s.setKeepAlive(true);
+        } catch {}
+      });
 
       socket.on("error", () => destroyBoth("client socket error"));
       socket.on("close", () => {
@@ -1930,7 +1937,6 @@ if (openclawListenOnExternal) {
 
           upstreamRes.on("error", () => destroyBoth("upstream response error"));
 
-          // Resume to allow the response to flush cleanly
           try {
             socket.resume();
           } catch {}
@@ -1965,14 +1971,12 @@ if (openclawListenOnExternal) {
         ];
         socket.write(lines.join("\r\n"));
 
-        // Client "head" belongs to upstream
         if (head && head.length) {
           try {
             upstreamSocket.write(head);
           } catch {}
         }
 
-        // Upstream "uHead" belongs to client
         if (uHead && uHead.length) {
           try {
             socket.write(uHead);
@@ -1982,7 +1986,6 @@ if (openclawListenOnExternal) {
         upstreamSocket.on("error", () => destroyBoth("upstream socket error"));
         upstreamSocket.on("close", () => destroyBoth("upstream socket closed"));
 
-        // Now that piping exists, resume inbound flow
         try {
           socket.resume();
         } catch {}
