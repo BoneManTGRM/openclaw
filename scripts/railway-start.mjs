@@ -20,16 +20,10 @@
 // 6) Extra hardening: normalize IPv6 zone ids, sanitize forwarded header values, and slightly safer agents.
 // 7) Safety: if enforce token auth is enabled but token is missing, auto disable it with a warning.
 //
-// Controls (same as before)
-// - OPENCLAW_READY_CHECK_MODE = "http" | "tcp" (default "http")
-// - OPENCLAW_READY_PATH = "/health" (default "/health")
-// - OPENCLAW_READY_FALLBACK_PATHS = "/,/ready" (default "/,/ready")
-// - OPENCLAW_READY_EXPECT = "200" | "2xx" | "any" | "200,204" (default "200")
-// - OPENCLAW_READY_TIMEOUT_MS = 1200 (default 1200)
-// - OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS=0 to disable upstream injection
-// - OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR=0 to disable auto-heal
-// - OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD=1 to force passing token to child
-// - OPENCLAW_ENFORCE_TOKEN_AUTH=1 to configure gateway auth in config (requires token)
+// Additional fixes in this version
+// A) Fix tcpCheck: avoid false negatives by not failing on "close" after a successful connect.
+// B) Hardening: killChild only SIGKILL if still alive.
+// C) Cleanup: avoid keeping an idle "do nothing" interval around in external listen mode.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -140,6 +134,7 @@ function tcpCheck(host, port, timeoutMs = 800) {
   return new Promise((resolve) => {
     const sock = net.connect({ host, port });
     let doneCalled = false;
+    let connected = false;
 
     const done = (ok) => {
       if (doneCalled) return;
@@ -151,10 +146,21 @@ function tcpCheck(host, port, timeoutMs = 800) {
     };
 
     sock.setTimeout(timeoutMs);
-    sock.on("connect", () => done(true));
+
+    sock.on("connect", () => {
+      connected = true;
+      done(true);
+    });
+
     sock.on("timeout", () => done(false));
     sock.on("error", () => done(false));
-    sock.on("close", () => done(false));
+
+    // Important: do not force a "false" on close if we already connected.
+    // Some environments can emit close soon after connect and that used to
+    // create occasional false negatives in readiness.
+    sock.on("close", () => {
+      if (!connected) done(false);
+    });
   });
 }
 
@@ -690,9 +696,13 @@ function killChild(child) {
   try {
     child.kill("SIGTERM");
   } catch {}
+
   setTimeout(() => {
     try {
-      child.kill("SIGKILL");
+      // Only SIGKILL if still alive
+      if (child.exitCode == null && child.signalCode == null) {
+        child.kill("SIGKILL");
+      }
     } catch {}
   }, 2500);
 }
@@ -1497,8 +1507,6 @@ if (openclawListenOnExternal) {
     console.error("[railway-start] unhandledRejection:", e?.stack || e);
     shutdown("unhandledRejection");
   });
-
-  setInterval(() => {}, 1 << 30);
 } else {
   const server = http.createServer(async (req, res) => {
     const url = req.url || "/";
