@@ -6,7 +6,7 @@
 // - Optionally lets OpenClaw bind directly to Railway PORT when OPENCLAW_LISTEN_ON_EXTERNAL=1.
 // - Writes a safe OpenClaw config (openclaw.json + config.json) with gateway.port and gateway.trustedProxies.
 // - Prevents pairing-required loops on Railway by stripping proxy-derived headers in selfSanitize mode.
-// - Fixes loopback Host header mismatch that can flip OpenClaw into “remote” mode.
+// - Fixes loopback Host header mismatch that can flip OpenClaw into "remote" mode.
 // - Optionally writes auth-profiles.json from env vars or ANTHROPIC_API_KEY / OPENAI_API_KEY.
 //
 // Key improvements in this update
@@ -17,6 +17,8 @@
 // 3) Proxy response headers are cleaned for hop-by-hop headers to avoid weirdness with some clients.
 // 4) Small hardening around remoteAddress formatting and socket lifecycle.
 // 5) Fix: X-Forwarded-For is now built safely (no trailing ", " when remoteAddr is empty).
+// 6) Extra hardening: normalize IPv6 zone ids, sanitize forwarded header values, and slightly safer agents.
+// 7) Safety: if enforce token auth is enabled but token is missing, auto disable it with a warning.
 //
 // Controls (same as before)
 // - OPENCLAW_READY_CHECK_MODE = "http" | "tcp" (default "http")
@@ -137,16 +139,22 @@ function parseTrustedProxies() {
 function tcpCheck(host, port, timeoutMs = 800) {
   return new Promise((resolve) => {
     const sock = net.connect({ host, port });
+    let doneCalled = false;
+
     const done = (ok) => {
+      if (doneCalled) return;
+      doneCalled = true;
       try {
         sock.destroy();
       } catch {}
       resolve(ok);
     };
+
     sock.setTimeout(timeoutMs);
     sock.on("connect", () => done(true));
     sock.on("timeout", () => done(false));
     sock.on("error", () => done(false));
+    sock.on("close", () => done(false));
   });
 }
 
@@ -360,7 +368,9 @@ const openclawListenOnExternal = envBool("OPENCLAW_LISTEN_ON_EXTERNAL", false);
 const internalPort = openclawListenOnExternal ? externalPort : internalPortDefault;
 
 const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
-const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
+
+// Token auth requested
+let enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
 // Inject gateway token into upstream requests (fixes token_mismatch for Control UI)
 let injectGatewayTokenHeaders = envBool("OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS", true);
@@ -371,6 +381,13 @@ const autoPassTokenOnAuthError = envBool("OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR
 // If token auth is not enforced, default to NOT passing OPENCLAW_GATEWAY_TOKEN into the child.
 let passGatewayTokenToChild =
   enforceTokenAuth || envBool("OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD", false);
+
+// Safety: if enforceTokenAuth was requested but token is missing, disable it
+if (enforceTokenAuth && !token) {
+  enforceTokenAuth = false;
+  console.log("[railway-start] warning: OPENCLAW_ENFORCE_TOKEN_AUTH=1 but OPENCLAW_GATEWAY_TOKEN is empty");
+  console.log("[railway-start] warning: disabling enforceTokenAuth to avoid broken auth config");
+}
 
 // Self sanitize config to a strict minimal object that cannot contain unknown keys.
 const selfSanitize = envBool("OPENCLAW_SELF_SANITIZE", true);
@@ -463,6 +480,9 @@ console.log(
 console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
 console.log("[railway-start] inject gateway token headers =", injectGatewayTokenHeaders ? "yes" : "no");
 console.log("[railway-start] pass gateway token to child =", passGatewayTokenToChild ? "yes" : "no");
+if (passGatewayTokenToChild && !token) {
+  console.log("[railway-start] warning: passGatewayTokenToChild=1 but token is empty");
+}
 console.log("[railway-start] autoPassTokenOnAuthError =", autoPassTokenOnAuthError ? "yes" : "no");
 console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" : "no");
 console.log("[railway-start] selfSanitize =", selfSanitize ? "yes" : "no");
@@ -728,8 +748,12 @@ function buildOpenClawArgs(bindMode) {
   ];
 
   // If we pass token to the child, also pass via CLI (some builds prefer this).
-  if (passGatewayTokenToChild && token) {
-    args.push("--token", token);
+  if (passGatewayTokenToChild) {
+    if (token) {
+      args.push("--token", token);
+    } else {
+      console.log("[railway-start] warning: passGatewayTokenToChild=1 but token is empty, skipping --token");
+    }
   }
 
   if (forceEnabled) {
@@ -795,8 +819,17 @@ async function isPortReadyAnyHost() {
   return { ok: false, host: null };
 }
 
-const proxyAgentHttp = new http.Agent({ keepAlive: true });
-const proxyAgentHttps = new https.Agent({ keepAlive: true });
+const proxyAgentHttp = new http.Agent({
+  keepAlive: true,
+  maxSockets: envInt("OPENCLAW_PROXY_AGENT_MAX_SOCKETS", 80),
+  maxFreeSockets: envInt("OPENCLAW_PROXY_AGENT_MAX_FREE_SOCKETS", 20),
+});
+
+const proxyAgentHttps = new https.Agent({
+  keepAlive: true,
+  maxSockets: envInt("OPENCLAW_PROXY_AGENT_MAX_SOCKETS", 80),
+  maxFreeSockets: envInt("OPENCLAW_PROXY_AGENT_MAX_FREE_SOCKETS", 20),
+});
 
 function selectUpstreamClient() {
   return upstreamProtocol === "https" ? https : http;
@@ -826,6 +859,12 @@ function applyGatewayTokenToHeaders(headers) {
   h["authorization"] = `Bearer ${token}`;
 
   return h;
+}
+
+function safeHeaderValue(v) {
+  // Prevent CRLF injection if upstream ever echoes forwarded headers
+  const s = headerValueToString(v);
+  return s.replace(/[\r\n]+/g, " ").trim();
 }
 
 async function httpReadyCheckOnce(pathToCheck) {
@@ -1230,9 +1269,17 @@ function pickHostHeaderForUpstream(req, xfHost) {
 }
 
 function cleanRemoteAddr(addr) {
-  const a = String(addr || "");
+  let a = String(addr || "");
   if (!a) return "";
-  if (a.startsWith("::ffff:")) return a.slice("::ffff:".length);
+  if (a.startsWith("::ffff:")) a = a.slice("::ffff:".length);
+
+  // Strip IPv6 zone id like "fe80::1%lo0"
+  const zoneIdx = a.indexOf("%");
+  if (zoneIdx >= 0) a = a.slice(0, zoneIdx);
+
+  // Remove brackets if present
+  if (a.startsWith("[") && a.endsWith("]")) a = a.slice(1, -1);
+
   return a;
 }
 
@@ -1250,8 +1297,8 @@ function buildForwardedHeaders(req) {
 
   // FIX: avoid creating "prior, " if remoteAddr is empty
   let xff = "";
-  if (priorXff && remoteAddr) xff = `${priorXff}, ${remoteAddr}`;
-  else if (priorXff) xff = String(priorXff);
+  if (priorXff && remoteAddr) xff = `${safeHeaderValue(priorXff)}, ${remoteAddr}`;
+  else if (priorXff) xff = safeHeaderValue(priorXff);
   else if (remoteAddr) xff = remoteAddr;
 
   const xfProto =
@@ -1293,8 +1340,8 @@ function buildForwardedHeaders(req) {
 
   const withForwarded = {
     ...cleaned,
-    [H_XFP]: String(xfProto),
-    [H_XFH]: String(xfHost),
+    [H_XFP]: String(safeHeaderValue(xfProto)),
+    [H_XFH]: String(safeHeaderValue(xfHost)),
     ...(xff ? { [H_XFF]: String(xff) } : {}),
     ...(remoteAddr ? { [H_XREAL]: String(remoteAddr) } : {}),
     [H_XFPORT]: String(externalPort),
@@ -1364,6 +1411,16 @@ function requestUpstream(req, res) {
   const proxyReq = client.request(options, (proxyRes) => {
     const safeHeaders = filterHopByHopResponseHeaders(proxyRes.headers);
     res.writeHead(proxyRes.statusCode || 502, safeHeaders);
+
+    proxyRes.on("error", () => {
+      try {
+        if (!res.headersSent) serveText(res, 502, "Bad gateway");
+      } catch {}
+      try {
+        res.end();
+      } catch {}
+    });
+
     proxyRes.pipe(res);
   });
 
@@ -1589,10 +1646,10 @@ if (openclawListenOnExternal) {
       const headers = buildForwardedHeaders(req);
 
       const client = selectUpstreamClient();
-      const agent = selectUpstreamAgent();
 
       const options = {
-        agent,
+        // For ws upgrade, agent pooling can be counterproductive on some Node versions.
+        agent: false,
         hostname: upstreamHost,
         port: internalPort,
         method: req.method,
