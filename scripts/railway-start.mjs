@@ -16,6 +16,11 @@
 // 4) IPv6-safe Host header builder so loopback Host rewriting does not break on ::1.
 // 5) In selfSanitize mode, strips proxy-derived headers and does NOT add x-forwarded-* back.
 // 6) Always sets explicit gateway.auth mode in sanitized config to prevent "implicit token" behavior on some builds.
+//
+// Additional hardening in this update
+// 7) OPENCLAW_CMD parsing supports quoted args (basic shell split).
+// 8) Shell execution for local bin uses safe quoting for paths and args.
+// 9) Proxy server explicitly disables server.requestTimeout (Railway sometimes defaults) to avoid long-lived WS drops.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -191,6 +196,76 @@ function buildLocalHostHeader(hostForUpstream, portForUpstream) {
   if (hh.includes(":")) return hh;
 
   return `${hh}:${portForUpstream}`;
+}
+
+// Basic shell-style split with quotes, for OPENCLAW_CMD only.
+// Supports: spaces, single quotes, double quotes, backslash escapes inside double quotes.
+function shellSplit(cmdline) {
+  const s = String(cmdline || "").trim();
+  if (!s) return [];
+  const out = [];
+  let cur = "";
+  let q = null; // "'" | '"' | null
+  let esc = false;
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+
+    if (esc) {
+      cur += ch;
+      esc = false;
+      continue;
+    }
+
+    if (q === '"') {
+      if (ch === "\\") {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') {
+        q = null;
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+
+    if (q === "'") {
+      if (ch === "'") {
+        q = null;
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      q = ch;
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      if (cur.length) out.push(cur), (cur = "");
+      continue;
+    }
+
+    cur += ch;
+  }
+
+  if (cur.length) out.push(cur);
+
+  return out;
+}
+
+function shQuoteArg(a) {
+  const s = String(a ?? "");
+  if (s.length === 0) return "''";
+  if (/^[A-Za-z0-9_./:@-]+$/.test(s)) return s;
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+function shJoin(cmd, args) {
+  return [cmd, ...(args || [])].map(shQuoteArg).join(" ");
 }
 
 // Railway port (public)
@@ -487,8 +562,9 @@ function scheduleRestart(waitMs) {
 function resolveOpenClawCommand() {
   const override = envStr("OPENCLAW_CMD", "").trim();
   if (override) {
-    console.log("[railway-start] using OPENCLAW_CMD override:", override);
-    const parts = override.split(" ").filter(Boolean);
+    const parts = shellSplit(override);
+    console.log("[railway-start] using OPENCLAW_CMD override:", parts.join(" "));
+    if (parts.length === 0) return null;
     return { kind: "direct", cmd: parts[0], argsPrefix: parts.slice(1) };
   }
 
@@ -549,7 +625,7 @@ function spawnOpenClawProcess(bindMode) {
   const args = [...resolved.argsPrefix, ...buildOpenClawArgs(bindMode)];
 
   if (resolved.kind === "localbin" && useShellForLocalBin) {
-    const cmdLine = [resolved.cmd, ...args].join(" ");
+    const cmdLine = shJoin(resolved.cmd, args);
     console.log("[railway-start] exec shell:", cmdLine);
     return spawn(cmdLine, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -1096,6 +1172,11 @@ if (openclawListenOnExternal) {
 
     requestUpstream(req, res);
   });
+
+  // Avoid timeouts killing long-lived requests and websocket upgrades
+  server.requestTimeout = 0;
+  server.headersTimeout = Math.max(server.headersTimeout || 60000, 65000);
+  server.keepAliveTimeout = Math.max(server.keepAliveTimeout || 5000, 65000);
 
   // WebSocket upgrade proxy
   server.on("upgrade", async (req, socket, head) => {
