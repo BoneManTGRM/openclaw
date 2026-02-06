@@ -454,7 +454,7 @@ const forceEnabled = forceRequested && hasWorkingLsof();
 // –no-doctor flag: bypass missing system utilities like lsof (Fix #8)
 const noDoctorEnabled = envBool(“OPENCLAW_NO_DOCTOR”, true);
 
-// Fix #2: Simplified stateDir selection — single iteration over candidates
+// Fix #2: Simplified stateDir selection – single iteration over candidates
 const candidates = [
 process.env.OPENCLAW_STATE_DIR,
 “/data/.openclaw”,
