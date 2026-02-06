@@ -49,6 +49,11 @@
 // EXTRA in this update (requested style stability)
 // - WebSocket: pause inbound client socket immediately, resume only after piping is attached
 // - WebSocket: configurable gentle close delay (OPENCLAW_WS_CLOSE_DELAY_MS) to reduce iOS/Safari flakiness
+//
+// NEW in this revision
+// - Forwarded port correctness: x-forwarded-port now prefers inbound x-forwarded-port, then override,
+//   then defaults to 443 for https or PORT for http. Helps origin correctness on Railway.
+// - KeepAlive tuning: setKeepAlive(true, 30000) on sockets to reduce mobile idle close flakiness.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -383,6 +388,16 @@ function matchesReadyExpect(statusCode, expectSpec) {
   return expectSpec.exact?.has(str) || false;
 }
 
+function safePortLike(v) {
+  const s = String(v ?? "").trim();
+  if (!s) return "";
+  const n = Number(s);
+  if (!Number.isFinite(n)) return "";
+  const i = Math.floor(n);
+  if (i < 1 || i > 65535) return "";
+  return String(i);
+}
+
 // Railway port (public)
 const externalPort = envInt("PORT", 8080);
 
@@ -458,6 +473,7 @@ const upstreamInsecure = envBool("OPENCLAW_UPSTREAM_INSECURE", false);
 // Optional: override forwarded host/proto if you want hardcoding.
 const forwardedProtoOverride = envStr("OPENCLAW_FORWARDED_PROTO", "");
 const forwardedHostOverride = envStr("OPENCLAW_FORWARDED_HOST", "");
+const forwardedPortOverride = envStr("OPENCLAW_FORWARDED_PORT", "");
 
 // Optional: if set, force the Host header sent upstream (rare)
 const upstreamHostHeaderOverride = envStr("OPENCLAW_UPSTREAM_HOST_HEADER", "");
@@ -1201,6 +1217,11 @@ function buildForwardedHeaders(req) {
   const inboundHost = safeHost(req.headers.host || "");
   const xfHost = safeHost(forwardedHostOverride) || inboundXfh || inboundHost || "";
 
+  const inboundXfPort = safePortLike(req.headers[H_XFPORT] || req.headers["x-forwarded-port"]);
+  const overridePort = safePortLike(forwardedPortOverride);
+  const xfPort =
+    overridePort || inboundXfPort || (xfProto === "https" ? "443" : safePortLike(externalPort) || "80");
+
   const hopByHop = new Set([
     "connection",
     "keep-alive",
@@ -1235,7 +1256,7 @@ function buildForwardedHeaders(req) {
       [H_XFH]: String(safeHeaderValue(xfHost)),
       ...(xff ? { [H_XFF]: String(xff) } : {}),
       ...(remoteAddr ? { [H_XREAL]: String(remoteAddr) } : {}),
-      [H_XFPORT]: String(externalPort),
+      [H_XFPORT]: String(xfPort),
     };
 
     return applyGatewayTokenToHeaders(rebuilt);
@@ -1247,7 +1268,7 @@ function buildForwardedHeaders(req) {
     [H_XFH]: String(safeHeaderValue(xfHost)),
     ...(xff ? { [H_XFF]: String(xff) } : {}),
     ...(remoteAddr ? { [H_XREAL]: String(remoteAddr) } : {}),
-    [H_XFPORT]: String(externalPort),
+    [H_XFPORT]: String(xfPort),
   };
 
   return applyGatewayTokenToHeaders(withForwarded);
@@ -1778,7 +1799,7 @@ if (openclawListenOnExternal) {
   server.on("connection", (sock) => {
     try {
       sock.setNoDelay(true);
-      sock.setKeepAlive(true);
+      sock.setKeepAlive(true, 30000);
     } catch {}
   });
 
@@ -1813,7 +1834,7 @@ if (openclawListenOnExternal) {
     try {
       socket.setNoDelay(true);
       socket.setTimeout(0);
-      socket.setKeepAlive(true);
+      socket.setKeepAlive(true, 30000);
     } catch {}
 
     const destroyBoth = (why = "") => {
@@ -1919,12 +1940,12 @@ if (openclawListenOnExternal) {
         try {
           socket.setNoDelay(true);
           socket.setTimeout(0);
-          socket.setKeepAlive(true);
+          socket.setKeepAlive(true, 30000);
         } catch {}
         try {
           upstreamSocket.setNoDelay(true);
           upstreamSocket.setTimeout(0);
-          upstreamSocket.setKeepAlive(true);
+          upstreamSocket.setKeepAlive(true, 30000);
         } catch {}
 
         const safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers);
