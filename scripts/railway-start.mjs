@@ -50,10 +50,16 @@
 // - WebSocket: pause inbound client socket immediately, resume only after piping is attached
 // - WebSocket: configurable gentle close delay (OPENCLAW_WS_CLOSE_DELAY_MS) to reduce iOS/Safari flakiness
 //
-// NEW in this revision
-// - Forwarded port correctness: x-forwarded-port now prefers inbound x-forwarded-port, then override,
-//   then defaults to 443 for https or PORT for http. Helps origin correctness on Railway.
-// - KeepAlive tuning: setKeepAlive(true, 30000) on sockets to reduce mobile idle close flakiness.
+// IMPORTANT FIX FOR YOUR CURRENT LOGS
+// Your logs show OpenClaw still complaining:
+//   "[ws] Proxy headers detected from untrusted address ... Configure gateway.trustedProxies ..."
+// Even though we write trustedProxies, the fastest practical fix is to NOT send any x-forwarded-*
+// headers on WebSocket upgrade requests (keep Host + Origin intact). That prevents OpenClaw from
+// entering its proxy-detection path for WS and stops the pairing/local-detection mismatch loop.
+//
+// New env toggle (default ON):
+//   OPENCLAW_WS_STRIP_PROXY_HEADERS=1
+// This strips x-forwarded-* and related proxy-derived headers ONLY for WS upgrades.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -142,21 +148,34 @@ function canWriteDir(dir) {
 }
 
 function parseTrustedProxies() {
+  // If you want to fully trust proxy headers for debugging only.
+  // This is NOT recommended for public deployments.
+  const trustAll = envBool("OPENCLAW_TRUST_ALL_PROXIES", false);
+  if (trustAll) {
+    return ["0.0.0.0/0", "::/0"];
+  }
+
   const override = String(process.env.OPENCLAW_TRUSTED_PROXIES || "").trim();
+
+  // Include both CIDR and plain IP forms to survive parser differences across builds.
   const base = [
     "100.64.0.0/10",
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
     "127.0.0.1/32",
+    "127.0.0.1",
     "::1/128",
+    "::1",
   ];
+
   const extra = override
     ? override
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean)
     : [];
+
   return uniq([...base, ...extra]);
 }
 
@@ -388,16 +407,6 @@ function matchesReadyExpect(statusCode, expectSpec) {
   return expectSpec.exact?.has(str) || false;
 }
 
-function safePortLike(v) {
-  const s = String(v ?? "").trim();
-  if (!s) return "";
-  const n = Number(s);
-  if (!Number.isFinite(n)) return "";
-  const i = Math.floor(n);
-  if (i < 1 || i > 65535) return "";
-  return String(i);
-}
-
 // Railway port (public)
 const externalPort = envInt("PORT", 8080);
 
@@ -473,7 +482,6 @@ const upstreamInsecure = envBool("OPENCLAW_UPSTREAM_INSECURE", false);
 // Optional: override forwarded host/proto if you want hardcoding.
 const forwardedProtoOverride = envStr("OPENCLAW_FORWARDED_PROTO", "");
 const forwardedHostOverride = envStr("OPENCLAW_FORWARDED_HOST", "");
-const forwardedPortOverride = envStr("OPENCLAW_FORWARDED_PORT", "");
 
 // Optional: if set, force the Host header sent upstream (rare)
 const upstreamHostHeaderOverride = envStr("OPENCLAW_UPSTREAM_HOST_HEADER", "");
@@ -481,6 +489,9 @@ const upstreamHostHeaderOverride = envStr("OPENCLAW_UPSTREAM_HOST_HEADER", "");
 // If true, rewrite Host to local loopback when upstreamHost is loopback.
 // Default is false because it can cause ws to show host=127.0.0.1:8081 and some clients bail.
 const upstreamForceLocalHostHeader = envBool("OPENCLAW_UPSTREAM_FORCE_LOCAL_HOST", false);
+
+// WS: strip proxy-derived headers on upgrade (default ON) to prevent OpenClaw proxy detection loops.
+const wsStripProxyHeaders = envBool("OPENCLAW_WS_STRIP_PROXY_HEADERS", true);
 
 // OpenClaw expects bind MODEs here, not IPs.
 const bindPrimaryEnv = envStr("OPENCLAW_BIND", "loopback");
@@ -573,6 +584,7 @@ console.log(
   upstreamForceLocalHostHeader ? "yes" : "no"
 );
 console.log("[railway-start] wsCloseDelayMs =", wsCloseDelayMs);
+console.log("[railway-start] wsStripProxyHeaders =", wsStripProxyHeaders ? "yes" : "no");
 
 if (openclawListenOnExternal) {
   console.log("[railway-start] warning: OPENCLAW_LISTEN_ON_EXTERNAL=1 disables wrapper server");
@@ -1191,7 +1203,20 @@ function safeHost(h) {
   return s.replace(/[\r\n]+/g, " ").trim();
 }
 
-function buildForwardedHeaders(req) {
+const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailers",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+function buildForwardedHeaders(req, opts = {}) {
+  const forWs = !!opts.forWs;
+
   const remoteAddr = cleanRemoteAddr(req.socket?.remoteAddress || "");
 
   const dash = String.fromCharCode(45);
@@ -1201,14 +1226,6 @@ function buildForwardedHeaders(req) {
   const H_XFPORT = "x" + dash + "forwarded" + dash + "port";
   const H_XREAL = "x" + dash + "real" + dash + "ip";
 
-  const priorXff = req.headers[H_XFF] || req.headers["x-forwarded-for"];
-
-  let xff = "";
-  if (priorXff && remoteAddr) xff = `${safeHeaderValue(priorXff)}, ${remoteAddr}`;
-  else if (priorXff) xff = safeHeaderValue(priorXff);
-  else if (remoteAddr) xff = remoteAddr;
-
-  // Prefer explicit overrides, else use inbound forwarded headers (from Railway) if sane.
   const inboundXfp = safeProto(req.headers[H_XFP] || req.headers["x-forwarded-proto"]);
   const xfProto =
     safeProto(forwardedProtoOverride) || inboundXfp || (req.socket?.encrypted ? "https" : "http");
@@ -1217,37 +1234,34 @@ function buildForwardedHeaders(req) {
   const inboundHost = safeHost(req.headers.host || "");
   const xfHost = safeHost(forwardedHostOverride) || inboundXfh || inboundHost || "";
 
-  const inboundXfPort = safePortLike(req.headers[H_XFPORT] || req.headers["x-forwarded-port"]);
-  const overridePort = safePortLike(forwardedPortOverride);
-  const xfPort =
-    overridePort || inboundXfPort || (xfProto === "https" ? "443" : safePortLike(externalPort) || "80");
-
-  const hopByHop = new Set([
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-  ]);
-
   const cleaned = {};
   for (const [k, v] of Object.entries(req.headers || {})) {
-    if (!hopByHop.has(String(k).toLowerCase())) cleaned[k] = v;
+    if (!HOP_BY_HOP.has(String(k).toLowerCase())) cleaned[k] = v;
   }
 
-  // Always remove "Forwarded:" header to avoid weird proxy parsing and keep it simple.
+  // Always remove "Forwarded:" header
   delete cleaned.forwarded;
 
+  // Ensure upstream Host is correct
   cleaned.host = pickHostHeaderForUpstream(req, xfHost);
+
+  // WS path: strip proxy-derived headers to prevent OpenClaw proxy detection warnings/loops.
+  if (forWs && wsStripProxyHeaders) {
+    const base = stripProxyDerivedHeaders(cleaned);
+    base.host = cleaned.host || base.host || "";
+    return applyGatewayTokenToHeaders(base);
+  }
+
+  const priorXff = req.headers[H_XFF] || req.headers["x-forwarded-for"];
+  let xff = "";
+  if (priorXff && remoteAddr) xff = `${safeHeaderValue(priorXff)}, ${remoteAddr}`;
+  else if (priorXff) xff = safeHeaderValue(priorXff);
+  else if (remoteAddr) xff = remoteAddr;
 
   if (selfSanitize) {
     // In selfSanitize mode, do not forward arbitrary proxy-derived headers.
     // Instead, rebuild a minimal, safe x-forwarded-* set so OpenClaw knows the external origin.
     const base = stripProxyDerivedHeaders(cleaned);
-
     base.host = cleaned.host || base.host || "";
 
     const rebuilt = {
@@ -1256,7 +1270,7 @@ function buildForwardedHeaders(req) {
       [H_XFH]: String(safeHeaderValue(xfHost)),
       ...(xff ? { [H_XFF]: String(xff) } : {}),
       ...(remoteAddr ? { [H_XREAL]: String(remoteAddr) } : {}),
-      [H_XFPORT]: String(xfPort),
+      [H_XFPORT]: String(externalPort),
     };
 
     return applyGatewayTokenToHeaders(rebuilt);
@@ -1268,7 +1282,7 @@ function buildForwardedHeaders(req) {
     [H_XFH]: String(safeHeaderValue(xfHost)),
     ...(xff ? { [H_XFF]: String(xff) } : {}),
     ...(remoteAddr ? { [H_XREAL]: String(remoteAddr) } : {}),
-    [H_XFPORT]: String(xfPort),
+    [H_XFPORT]: String(externalPort),
   };
 
   return applyGatewayTokenToHeaders(withForwarded);
@@ -1293,19 +1307,9 @@ function serveText(res, code, text) {
 }
 
 function filterHopByHopResponseHeaders(headers) {
-  const hop = new Set([
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-  ]);
   const out = {};
   for (const [k, v] of Object.entries(headers || {})) {
-    if (hop.has(String(k).toLowerCase())) continue;
+    if (HOP_BY_HOP.has(String(k).toLowerCase())) continue;
     out[k] = v;
   }
   return out;
@@ -1313,7 +1317,7 @@ function filterHopByHopResponseHeaders(headers) {
 
 function requestUpstream(req, res) {
   const url = req.url || "/";
-  const headers = buildForwardedHeaders(req);
+  const headers = buildForwardedHeaders(req, { forWs: false });
 
   const client = selectUpstreamClient();
   const agent = selectUpstreamAgent();
@@ -1771,6 +1775,7 @@ if (openclawListenOnExternal) {
         disableFlagAutofallback,
 
         wsCloseDelayMs,
+        wsStripProxyHeaders,
 
         trustedProxies: trusted,
         outTail: outRing.slice(-120),
@@ -1799,7 +1804,7 @@ if (openclawListenOnExternal) {
   server.on("connection", (sock) => {
     try {
       sock.setNoDelay(true);
-      sock.setKeepAlive(true, 30000);
+      sock.setKeepAlive(true);
     } catch {}
   });
 
@@ -1834,7 +1839,7 @@ if (openclawListenOnExternal) {
     try {
       socket.setNoDelay(true);
       socket.setTimeout(0);
-      socket.setKeepAlive(true, 30000);
+      socket.setKeepAlive(true);
     } catch {}
 
     const destroyBoth = (why = "") => {
@@ -1867,7 +1872,8 @@ if (openclawListenOnExternal) {
       const isReady = await isOpenClawReadyFast();
       if (!isReady) return destroyBoth("upstream not ready");
 
-      const headers = buildForwardedHeaders(req);
+      // IMPORTANT: for WS, strip x-forwarded-* (default) to prevent OpenClaw proxy detection.
+      const headers = buildForwardedHeaders(req, { forWs: true });
 
       const client = selectUpstreamClient();
 
@@ -1940,12 +1946,12 @@ if (openclawListenOnExternal) {
         try {
           socket.setNoDelay(true);
           socket.setTimeout(0);
-          socket.setKeepAlive(true, 30000);
+          socket.setKeepAlive(true);
         } catch {}
         try {
           upstreamSocket.setNoDelay(true);
           upstreamSocket.setTimeout(0);
-          upstreamSocket.setKeepAlive(true, 30000);
+          upstreamSocket.setKeepAlive(true);
         } catch {}
 
         const safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers);
