@@ -22,25 +22,24 @@
 // 6) WebSocket proxy handles non-101 upstream responses safely (no hanging sockets).
 //
 // Updates in this version
-// - Adds an optional HTTP readiness check (default path /health) in addition to TCP.
-//   This reduces false positives where a port is open but the app is not serving yet.
+// - Readiness supports HTTP and TCP, with HTTP fallbacks to reduce false negatives.
 //   Controls:
 //   - OPENCLAW_READY_CHECK_MODE = "http" | "tcp" (default "http")
 //   - OPENCLAW_READY_PATH = "/health" (default "/health")
-//   - OPENCLAW_READY_EXPECT = "200" (default "200")
+//   - OPENCLAW_READY_FALLBACK_PATHS = "/,/ready" (default "/,/ready")
+//   - OPENCLAW_READY_EXPECT = "200" | "2xx" | "any" | "200,204" (default "200")
 //   - OPENCLAW_READY_TIMEOUT_MS = 1200 (default 1200)
 // - Watchdog uses the same readiness check for better signal.
 // - Do NOT write gateway.auth unless token auth is explicitly enabled.
-//   Some OpenClaw builds reject gateway.auth.mode or the "none" enum and will exit on boot.
 // - Prevents confusing token mismatch loops by default:
 //   If OPENCLAW_ENFORCE_TOKEN_AUTH=0, this wrapper will NOT pass OPENCLAW_GATEWAY_TOKEN to the child
 //   unless OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD=1 is set.
 //   The wrapper can still use the token for proxy-level auth if OPENCLAW_PROXY_ENFORCE_TOKEN=1.
-// - /debug now includes a token fingerprint (hash prefix + length) without revealing the token.
+// - /debug includes a token fingerprint (hash prefix + length) without revealing the token.
 //
 // Fixes in this update (based on your logs)
 // - Ensures the child receives the token when needed:
-//   - passGatewayTokenToChild is now mutable (let), so we can auto-heal.
+//   - passGatewayTokenToChild is mutable (let), so we can auto-heal.
 //   - When passing token to child, we also pass CLI args: --token <token>.
 //   - Auto-heal: if OpenClaw logs "Gateway auth is set to token, but no token is configured",
 //     we flip passGatewayTokenToChild to true for the next restart.
@@ -324,6 +323,47 @@ function tokenFingerprint(tok) {
   return { present: true, len: t.length, sha256_8: hex.slice(0, 8) };
 }
 
+function parseReadyExpect(expectRaw) {
+  const raw = String(expectRaw || "").trim().toLowerCase();
+  if (!raw) return { mode: "exact", exact: new Set(["200"]) };
+  if (raw === "2xx") return { mode: "2xx" };
+  if (raw === "any") return { mode: "any" };
+
+  const parts = raw
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  if (parts.length === 0) return { mode: "exact", exact: new Set(["200"]) };
+  return { mode: "exact", exact: new Set(parts) };
+}
+
+function parseReadyFallbackPaths(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return ["/", "/ready"];
+  const parts = s
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((p) => (p.startsWith("/") ? p : `/${p}`));
+  return parts.length ? parts : ["/", "/ready"];
+}
+
+function matchesReadyExpect(statusCode, expectSpec) {
+  const code = Number(statusCode);
+  if (!Number.isFinite(code)) return false;
+
+  if (expectSpec.mode === "2xx") return code >= 200 && code <= 299;
+
+  if (expectSpec.mode === "any") {
+    // Treat any non-5xx as "serving something"
+    return code >= 200 && code <= 499;
+  }
+
+  const str = String(code);
+  return expectSpec.exact?.has(str) || false;
+}
+
 // Railway port (public)
 const externalPort = envInt("PORT", 8080);
 
@@ -343,7 +383,6 @@ const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 const autoPassTokenOnAuthError = envBool("OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR", true);
 
 // If token auth is not enforced, default to NOT passing OPENCLAW_GATEWAY_TOKEN into the child.
-// This prevents accidental "token_mismatch" loops when the UI has an old token stored.
 let passGatewayTokenToChild =
   enforceTokenAuth || envBool("OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD", false);
 
@@ -360,7 +399,10 @@ const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
 const readyCheckMode =
   envStr("OPENCLAW_READY_CHECK_MODE", "http").toLowerCase() === "tcp" ? "tcp" : "http";
 const readyPath = envStr("OPENCLAW_READY_PATH", "/health") || "/health";
-const readyExpect = String(envStr("OPENCLAW_READY_EXPECT", "200")).trim() || "200";
+const readyFallbackPaths = parseReadyFallbackPaths(envStr("OPENCLAW_READY_FALLBACK_PATHS", "/,/ready"));
+const readyExpectRaw = String(envStr("OPENCLAW_READY_EXPECT", "200")).trim() || "200";
+const readyExpectSpec = parseReadyExpect(readyExpectRaw);
+
 let readyTimeoutMs = envInt("OPENCLAW_READY_TIMEOUT_MS", 1200);
 readyTimeoutMs = clamp(readyTimeoutMs, 250, 8000);
 
@@ -444,8 +486,10 @@ console.log(
   readyCheckMode,
   "readyPath =",
   readyPath,
+  "readyFallbackPaths =",
+  readyFallbackPaths.join(","),
   "readyExpect =",
-  readyExpect
+  readyExpectRaw
 );
 
 if (openclawListenOnExternal) {
@@ -770,7 +814,7 @@ function selectUpstreamAgent() {
   return upstreamProtocol === "https" ? proxyAgentHttps : proxyAgentHttp;
 }
 
-async function httpReadyCheckOnce() {
+async function httpReadyCheckOnce(pathToCheck) {
   const client = selectUpstreamClient();
   const agent = selectUpstreamAgent();
   const insecure = envBool("OPENCLAW_UPSTREAM_INSECURE", false);
@@ -780,10 +824,10 @@ async function httpReadyCheckOnce() {
     hostname: upstreamHost,
     port: internalPort,
     method: "GET",
-    path: readyPath,
+    path: pathToCheck,
     headers: {
       host: upstreamHostHeaderOverride || buildLocalHostHeader(upstreamHost, internalPort),
-      accept: "text/plain,application/json",
+      accept: "text/plain,application/json,*/*",
       "user-agent": "railway-start-readycheck",
     },
     timeout: readyTimeoutMs,
@@ -795,17 +839,17 @@ async function httpReadyCheckOnce() {
 
   return new Promise((resolve) => {
     const req = client.request(options, (res) => {
-      const code = String(res.statusCode || "");
+      const code = Number(res.statusCode || 0);
       res.resume();
-      resolve(code === readyExpect);
+      resolve({ ok: matchesReadyExpect(code, readyExpectSpec), code, path: pathToCheck });
     });
     req.on("timeout", () => {
       try {
         req.destroy(new Error("ready timeout"));
       } catch {}
-      resolve(false);
+      resolve({ ok: false, code: 0, path: pathToCheck, timeout: true });
     });
-    req.on("error", () => resolve(false));
+    req.on("error", () => resolve({ ok: false, code: 0, path: pathToCheck, error: true }));
     req.end();
   });
 }
@@ -816,12 +860,42 @@ async function isOpenClawReadySignal() {
     return { ok: r.ok, detail: r };
   }
 
-  // http mode: require TCP first, then HTTP path
+  // http mode: require TCP first, then HTTP path (with fallbacks)
   const r = await isPortReadyAnyHost();
   if (!r.ok) return { ok: false, detail: r };
 
-  const okHttp = await httpReadyCheckOnce();
-  return { ok: okHttp, detail: { ...r, http: okHttp, path: readyPath, expect: readyExpect } };
+  // First try primary path
+  const first = await httpReadyCheckOnce(readyPath);
+  if (first.ok) {
+    return {
+      ok: true,
+      detail: { ...r, http: true, path: first.path, code: first.code, expect: readyExpectRaw },
+    };
+  }
+
+  // Then try fallbacks (excluding the primary if duplicated)
+  for (const p of readyFallbackPaths) {
+    if (p === readyPath) continue;
+    const chk = await httpReadyCheckOnce(p);
+    if (chk.ok) {
+      return {
+        ok: true,
+        detail: { ...r, http: true, path: chk.path, code: chk.code, expect: readyExpectRaw },
+      };
+    }
+  }
+
+  // Not ready on HTTP
+  return {
+    ok: false,
+    detail: {
+      ...r,
+      http: false,
+      pathTried: [readyPath, ...readyFallbackPaths.filter((p) => p !== readyPath)],
+      last: { path: first.path, code: first.code },
+      expect: readyExpectRaw,
+    },
+  };
 }
 
 async function waitForOpenClawReady(timeoutMs, child) {
@@ -850,9 +924,11 @@ async function waitForOpenClawReady(timeoutMs, child) {
           "port",
           internalPort,
           "path",
-          readyPath,
+          sig.detail.path,
+          "code",
+          sig.detail.code,
           "expect",
-          readyExpect
+          readyExpectRaw
         );
       }
       return true;
@@ -1341,7 +1417,8 @@ if (openclawListenOnExternal) {
 
         readyMode: readyCheckMode,
         readyPath,
-        readyExpect,
+        readyFallbackPaths,
+        readyExpect: readyExpectRaw,
         readyOk: sig.ok,
         readyDetail: sig.detail,
 
@@ -1520,7 +1597,12 @@ if (openclawListenOnExternal) {
         ];
         socket.write(lines.join("\r\n"));
 
-        if (head && head.length) upstreamSocket.write(head);
+        // Forward any buffered client data (head) into upstream
+        if (head && head.length) {
+          try {
+            upstreamSocket.write(head);
+          } catch {}
+        }
 
         socket.pipe(upstreamSocket).pipe(socket);
 
