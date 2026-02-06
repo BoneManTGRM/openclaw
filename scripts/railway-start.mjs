@@ -37,6 +37,10 @@
 //   unless OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD=1 is set.
 //   The wrapper can still use the token for proxy-level auth if OPENCLAW_PROXY_ENFORCE_TOKEN=1.
 // - /debug now includes a token fingerprint (hash prefix + length) without revealing the token.
+//
+// Fix in this update (your crash):
+// - Removed duplicate `let claw = null;` (and related state vars) which caused:
+//   SyntaxError: Identifier 'claw' has already been declared
 
 import fs from "node:fs";
 import path from "node:path";
@@ -346,7 +350,8 @@ const watchdogIntervalMs = envInt("OPENCLAW_WATCHDOG_INTERVAL_MS", 8000);
 const proxyTimeoutMs = envInt("OPENCLAW_PROXY_TIMEOUT_MS", 60000);
 
 // Readiness checks
-const readyCheckMode = envStr("OPENCLAW_READY_CHECK_MODE", "http").toLowerCase() === "tcp" ? "tcp" : "http";
+const readyCheckMode =
+  envStr("OPENCLAW_READY_CHECK_MODE", "http").toLowerCase() === "tcp" ? "tcp" : "http";
 const readyPath = envStr("OPENCLAW_READY_PATH", "/health") || "/health";
 const readyExpect = String(envStr("OPENCLAW_READY_EXPECT", "200")).trim() || "200";
 let readyTimeoutMs = envInt("OPENCLAW_READY_TIMEOUT_MS", 1200);
@@ -412,7 +417,10 @@ console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
 console.log("[railway-start] openclawListenOnExternal =", openclawListenOnExternal ? "yes" : "no");
 console.log("[railway-start] chosen stateDir =", stateDir);
 console.log("[railway-start] token present =", token ? "yes" : "no");
-console.log("[railway-start] token fingerprint =", tokenFp.present ? `${tokenFp.sha256_8} (len ${tokenFp.len})` : "none");
+console.log(
+  "[railway-start] token fingerprint =",
+  tokenFp.present ? `${tokenFp.sha256_8} (len ${tokenFp.len})` : "none"
+);
 console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
 console.log("[railway-start] pass gateway token to child =", passGatewayTokenToChild ? "yes" : "no");
 console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" : "no");
@@ -423,7 +431,14 @@ console.log("[railway-start] OPENCLAW_SHELL_LOCAL_BIN =", useShellForLocalBin ? 
 console.log("[railway-start] OpenClaw force requested =", forceRequested ? "yes" : "no");
 console.log("[railway-start] OpenClaw force enabled =", forceEnabled ? "yes" : "no");
 console.log("[railway-start] upstream =", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
-console.log("[railway-start] readyCheckMode =", readyCheckMode, "readyPath =", readyPath, "readyExpect =", readyExpect);
+console.log(
+  "[railway-start] readyCheckMode =",
+  readyCheckMode,
+  "readyPath =",
+  readyPath,
+  "readyExpect =",
+  readyExpect
+);
 
 if (openclawListenOnExternal) {
   console.log("[railway-start] warning: OPENCLAW_LISTEN_ON_EXTERNAL=1 disables wrapper server");
@@ -578,6 +593,9 @@ safeWriteJson(configB, configToWrite);
   safeWriteJson(authPath, authObj);
 })();
 
+// ---------------------------
+// OpenClaw process state
+// ---------------------------
 let claw = null;
 let clawStarting = false;
 let clawReady = false;
@@ -846,14 +864,6 @@ async function waitForOpenClawReady(timeoutMs, child) {
 
   return false;
 }
-
-let claw = null;
-let clawStarting = false;
-let clawReady = false;
-
-let restartAttempt = 0;
-let startLoopId = 0;
-let restartScheduled = false;
 
 async function startOpenClawLoop() {
   const myLoopId = ++startLoopId;
@@ -1465,7 +1475,9 @@ if (openclawListenOnExternal) {
 
       upstreamReq.on("upgrade", (upstreamRes, upstreamSocket) => {
         const lines = [
-          `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage || ""}`.trim(),
+          `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${
+            upstreamRes.statusMessage || ""
+          }`.trim(),
           ...headersToLines(upstreamRes.headers),
           "",
           "",
