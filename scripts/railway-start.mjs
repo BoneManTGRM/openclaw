@@ -9,51 +9,25 @@
 // - Fixes loopback Host header mismatch that can flip OpenClaw into “remote” mode.
 // - Optionally writes auth-profiles.json from env vars or ANTHROPIC_API_KEY / OPENAI_API_KEY.
 //
-// Notes for Railway reliability
-// - Best default is proxy mode: wrapper binds PORT, OpenClaw binds internal port.
-// - If you enable OPENCLAW_LISTEN_ON_EXTERNAL=1, wrapper server is disabled to avoid port collisions.
+// Key improvements in this update
+// 1) Token injection is now based on actual child token usage, not only OPENCLAW_ENFORCE_TOKEN_AUTH.
+//    If the child is receiving a token (passGatewayTokenToChild) the proxy will inject it upstream
+//    so Control UI avoids token_mismatch.
+// 2) Readiness checks also inject the token when the child is using token auth.
+// 3) Proxy response headers are cleaned for hop-by-hop headers to avoid weirdness with some clients.
+// 4) Small hardening around remoteAddress formatting and socket lifecycle.
+// 5) Fix: X-Forwarded-For is now built safely (no trailing ", " when remoteAddr is empty).
 //
-// Key fixes in this version
-// 1) Host header parsing is IPv6 safe (handles [::1]:port correctly).
-// 2) Adds server “clientError” handler to avoid crashes on malformed requests.
-// 3) Tightens readiness and restart behavior (kills child on not-ready).
-// 4) Keeps selfSanitize behavior: strips proxy-derived headers and does not add x-forwarded-* back.
-// 5) Keeps OpenClaw bind logic: proxy mode prefers loopback, fallback to lan after failures.
-// 6) WebSocket proxy handles non-101 upstream responses safely (no hanging sockets).
-//
-// Updates in this version
-// - Readiness supports HTTP and TCP, with HTTP fallbacks to reduce false negatives.
-//   Controls:
-//   - OPENCLAW_READY_CHECK_MODE = "http" | "tcp" (default "http")
-//   - OPENCLAW_READY_PATH = "/health" (default "/health")
-//   - OPENCLAW_READY_FALLBACK_PATHS = "/,/ready" (default "/,/ready")
-//   - OPENCLAW_READY_EXPECT = "200" | "2xx" | "any" | "200,204" (default "200")
-//   - OPENCLAW_READY_TIMEOUT_MS = 1200 (default 1200)
-// - Watchdog uses the same readiness check for better signal.
-// - Do NOT write gateway.auth unless token auth is explicitly enabled.
-// - Prevents confusing token mismatch loops by default:
-//   If OPENCLAW_ENFORCE_TOKEN_AUTH=0, this wrapper will NOT pass OPENCLAW_GATEWAY_TOKEN to the child
-//   unless OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD=1 is set.
-//   The wrapper can still use the token for proxy-level auth if OPENCLAW_PROXY_ENFORCE_TOKEN=1.
-// - /debug includes a token fingerprint (hash prefix + length) without revealing the token.
-//
-// Fixes in this update (based on your logs)
-// - Ensures the child receives the token when needed:
-//   - passGatewayTokenToChild is mutable (let), so we can auto-heal.
-//   - When passing token to child, we also pass CLI args: --token <token>.
-//   - Auto-heal: if OpenClaw logs “Gateway auth is set to token, but no token is configured”,
-//     we flip passGatewayTokenToChild to true for the next restart.
-//   - Control auto-heal with OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR=0 to disable.
-//
-// Additional fix in this update (token_mismatch on Control UI)
-// - When OPENCLAW_ENFORCE_TOKEN_AUTH=1, browsers often cannot add the required WS header.
-// - This wrapper injects the gateway token into upstream HTTP and WS requests so the UI works.
-//   Control with OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS=0 to disable.
-//
-// Additional fixes in this update (hardening)
-// - Proxy HTTP request lifecycle: if client disconnects, upstream request is destroyed.
-// - WebSocket upgrade lifecycle: if either side closes, the other side is destroyed.
-// - WebSocket path: if upstream never upgrades and client closes early, upstream request is destroyed.
+// Controls (same as before)
+// - OPENCLAW_READY_CHECK_MODE = "http" | "tcp" (default "http")
+// - OPENCLAW_READY_PATH = "/health" (default "/health")
+// - OPENCLAW_READY_FALLBACK_PATHS = "/,/ready" (default "/,/ready")
+// - OPENCLAW_READY_EXPECT = "200" | "2xx" | "any" | "200,204" (default "200")
+// - OPENCLAW_READY_TIMEOUT_MS = 1200 (default 1200)
+// - OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS=0 to disable upstream injection
+// - OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR=0 to disable auto-heal
+// - OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD=1 to force passing token to child
+// - OPENCLAW_ENFORCE_TOKEN_AUTH=1 to configure gateway auth in config (requires token)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -247,7 +221,7 @@ function shellSplit(cmdline) {
   if (!s) return [];
   const out = [];
   let cur = "";
-  let q = null; // "'" | '"' | null
+  let q = null;
   let esc = false;
 
   for (let i = 0; i < s.length; i++) {
@@ -389,7 +363,7 @@ const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 
 // Inject gateway token into upstream requests (fixes token_mismatch for Control UI)
-const injectGatewayTokenHeaders = envBool("OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS", true);
+let injectGatewayTokenHeaders = envBool("OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS", true);
 
 // Auto-heal when OpenClaw complains auth token missing
 const autoPassTokenOnAuthError = envBool("OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR", true);
@@ -615,11 +589,6 @@ safeWriteJson(configA, configToWrite);
 safeWriteJson(configB, configToWrite);
 
 // Optional: write OpenClaw agent auth store if provided.
-// Priority:
-// 1) OPENCLAW_AUTH_PROFILES_JSON (raw JSON string)
-// 2) OPENCLAW_AUTH_PROFILES_B64  (base64 JSON)
-// 3) OPENAI_API_KEY              (auto-generate minimal auth-profiles.json)
-// 4) ANTHROPIC_API_KEY           (auto-generate minimal auth-profiles.json)
 (function writeAuthProfilesIfProvided() {
   const jsonRaw = envStr("OPENCLAW_AUTH_PROFILES_JSON", "").trim();
   const b64 = envStr("OPENCLAW_AUTH_PROFILES_B64", "").trim();
@@ -837,15 +806,23 @@ function selectUpstreamAgent() {
   return upstreamProtocol === "https" ? proxyAgentHttps : proxyAgentHttp;
 }
 
-function applyGatewayTokenToHeaders(headers) {
-  if (!enforceTokenAuth) return headers;
-  if (!token) return headers;
-  if (!injectGatewayTokenHeaders) return headers;
+// IMPORTANT: inject token when the upstream is actually using token auth.
+// That is true if either enforceTokenAuth is on OR the child is receiving the token.
+function shouldInjectGatewayToken() {
+  if (!token) return false;
+  if (!injectGatewayTokenHeaders) return false;
+  if (enforceTokenAuth) return true;
+  if (passGatewayTokenToChild) return true;
+  return false;
+}
 
+function applyGatewayTokenToHeaders(headers) {
+  if (!shouldInjectGatewayToken()) return headers;
   const h = { ...(headers || {}) };
 
-  // Always force correct token upstream to prevent mismatches.
+  // Try multiple names to match different builds, plus Authorization.
   h["x-openclaw-token"] = token;
+  h["x-openclaw-gateway-token"] = token;
   h["authorization"] = `Bearer ${token}`;
 
   return h;
@@ -900,11 +877,9 @@ async function isOpenClawReadySignal() {
     return { ok: r.ok, detail: r };
   }
 
-  // http mode: require TCP first, then HTTP path (with fallbacks)
   const r = await isPortReadyAnyHost();
   if (!r.ok) return { ok: false, detail: r };
 
-  // First try primary path
   const first = await httpReadyCheckOnce(readyPath);
   if (first.ok) {
     return {
@@ -913,7 +888,6 @@ async function isOpenClawReadySignal() {
     };
   }
 
-  // Then try fallbacks (excluding the primary if duplicated)
   for (const p of readyFallbackPaths) {
     if (p === readyPath) continue;
     const chk = await httpReadyCheckOnce(p);
@@ -1046,6 +1020,15 @@ async function startOpenClawLoop() {
       for (const ln of lines) {
         pushRing(outRing, ln);
         console.log("[openclaw]", ln);
+
+        // Auto-heal for token mismatch errors: ensure injection is enabled.
+        if (token && !injectGatewayTokenHeaders) {
+          const low = String(ln || "").toLowerCase();
+          if (low.includes("token_mismatch") || low.includes("token mismatch")) {
+            injectGatewayTokenHeaders = true;
+            console.log("[railway-start] detected token mismatch log; enabling injectGatewayTokenHeaders");
+          }
+        }
       }
     });
     claw.stdout.on("end", () => console.log("[railway-start] child stdout ended"));
@@ -1075,6 +1058,15 @@ async function startOpenClawLoop() {
             console.log(
               "[railway-start] detected auth token missing; enabling passGatewayTokenToChild for next restart"
             );
+          }
+        }
+
+        // Auto-heal: token mismatch indicates UI or proxy is not sending token
+        if (token && !injectGatewayTokenHeaders) {
+          const low = String(ln || "").toLowerCase();
+          if (low.includes("token_mismatch") || low.includes("token mismatch")) {
+            injectGatewayTokenHeaders = true;
+            console.log("[railway-start] detected token mismatch; enabling injectGatewayTokenHeaders");
           }
         }
       }
@@ -1139,7 +1131,6 @@ async function startOpenClawLoop() {
     dumpRing("[railway-start][openclaw STDOUT]", outRing);
     dumpRing("[railway-start][openclaw STDERR]", errRing);
 
-    // Increment startLoopId BEFORE killing child to prevent double restarts
     startLoopId++;
 
     const child = claw;
@@ -1170,6 +1161,7 @@ function checkProxyToken(req) {
 
   const hdr =
     normalizeToken(req.headers["x-openclaw-token"]) ||
+    normalizeToken(req.headers["x-openclaw-gateway-token"]) ||
     normalizeToken(req.headers["x-api-key"]) ||
     "";
 
@@ -1230,7 +1222,6 @@ function pickHostHeaderForUpstream(req, xfHost) {
   const inboundHost = req.headers?.host || "";
   const inboundIsLocal = isLocalHostHeader(inboundHost);
 
-  // If proxying to loopback and inbound Host is not local, rewrite Host to local for OpenClaw.
   if (isLoopbackHost(upstreamHost) && !inboundIsLocal) {
     return buildLocalHostHeader(upstreamHost, internalPort);
   }
@@ -1238,8 +1229,15 @@ function pickHostHeaderForUpstream(req, xfHost) {
   return String(xfHost || inboundHost || "");
 }
 
+function cleanRemoteAddr(addr) {
+  const a = String(addr || "");
+  if (!a) return "";
+  if (a.startsWith("::ffff:")) return a.slice("::ffff:".length);
+  return a;
+}
+
 function buildForwardedHeaders(req) {
-  const remoteAddr = req.socket?.remoteAddress || "";
+  const remoteAddr = cleanRemoteAddr(req.socket?.remoteAddress || "");
 
   const dash = String.fromCharCode(45);
   const H_XFF = "x" + dash + "forwarded" + dash + "for";
@@ -1249,7 +1247,12 @@ function buildForwardedHeaders(req) {
   const H_XREAL = "x" + dash + "real" + dash + "ip";
 
   const priorXff = req.headers[H_XFF] || req.headers["x-forwarded-for"];
-  const xff = priorXff ? `${priorXff}, ${remoteAddr}` : remoteAddr;
+
+  // FIX: avoid creating "prior, " if remoteAddr is empty
+  let xff = "";
+  if (priorXff && remoteAddr) xff = `${priorXff}, ${remoteAddr}`;
+  else if (priorXff) xff = String(priorXff);
+  else if (remoteAddr) xff = remoteAddr;
 
   const xfProto =
     forwardedProtoOverride ||
@@ -1282,7 +1285,6 @@ function buildForwardedHeaders(req) {
 
   cleaned.host = pickHostHeaderForUpstream(req, xfHost);
 
-  // Self sanitize: strip proxy-derived headers and do not add x-forwarded-* back.
   if (selfSanitize) {
     const stripped = stripProxyDerivedHeaders(cleaned);
     stripped.host = cleaned.host || stripped.host || "";
@@ -1293,8 +1295,8 @@ function buildForwardedHeaders(req) {
     ...cleaned,
     [H_XFP]: String(xfProto),
     [H_XFH]: String(xfHost),
-    [H_XFF]: String(xff),
-    [H_XREAL]: String(remoteAddr),
+    ...(xff ? { [H_XFF]: String(xff) } : {}),
+    ...(remoteAddr ? { [H_XREAL]: String(remoteAddr) } : {}),
     [H_XFPORT]: String(externalPort),
   };
 
@@ -1319,6 +1321,25 @@ function serveText(res, code, text) {
   res.end(text);
 }
 
+function filterHopByHopResponseHeaders(headers) {
+  const hop = new Set([
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+  ]);
+  const out = {};
+  for (const [k, v] of Object.entries(headers || {})) {
+    if (hop.has(String(k).toLowerCase())) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 function requestUpstream(req, res) {
   const url = req.url || "/";
   const headers = buildForwardedHeaders(req);
@@ -1341,11 +1362,11 @@ function requestUpstream(req, res) {
   }
 
   const proxyReq = client.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    const safeHeaders = filterHopByHopResponseHeaders(proxyRes.headers);
+    res.writeHead(proxyRes.statusCode || 502, safeHeaders);
     proxyRes.pipe(res);
   });
 
-  // If the client goes away, stop work upstream.
   const abortUpstream = () => {
     try {
       proxyReq.destroy();
@@ -1516,16 +1537,14 @@ if (openclawListenOnExternal) {
     requestUpstream(req, res);
   });
 
-  // Avoid timeouts killing long-lived requests and websocket upgrades
   server.requestTimeout = 0;
   server.keepAliveTimeout = 65000;
-  server.headersTimeout = 70000; // Must be strictly > keepAliveTimeout to avoid Node warnings
+  server.headersTimeout = 70000;
 
   server.on("error", (e) => {
     console.error("[railway-start] server error:", e?.stack || e);
   });
 
-  // Avoid process crash from malformed HTTP
   server.on("clientError", (err, socket) => {
     try {
       if (socket && socket.writable) {
@@ -1600,9 +1619,10 @@ if (openclawListenOnExternal) {
         try {
           const statusCode = upstreamRes.statusCode || 502;
           const statusMsg = upstreamRes.statusMessage || "";
+          const safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers);
           const lines = [
             `HTTP/${upstreamRes.httpVersion || "1.1"} ${statusCode} ${statusMsg}`.trim(),
-            ...headersToLines(upstreamRes.headers),
+            ...headersToLines(safeHeaders),
             "",
             "",
           ];
@@ -1630,22 +1650,21 @@ if (openclawListenOnExternal) {
       upstreamReq.on("upgrade", (upstreamRes, us, uHead) => {
         upstreamSocket = us;
 
+        const safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers);
         const lines = [
           `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage || ""}`.trim(),
-          ...headersToLines(upstreamRes.headers),
+          ...headersToLines(safeHeaders),
           "",
           "",
         ];
         socket.write(lines.join("\r\n"));
 
-        // Forward any buffered data (head) into upstream before piping
         if (head && head.length) {
           try {
             upstreamSocket.write(head);
           } catch {}
         }
 
-        // Also forward any buffered upstream head if present
         if (uHead && uHead.length) {
           try {
             socket.write(uHead);
