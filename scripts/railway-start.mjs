@@ -172,10 +172,20 @@ function isLocalHostHeader(hostHeader) {
   );
 }
 
+// FIX: handle IPv6 host header formatting correctly
 function buildLocalHostHeader(hostForUpstream, portForUpstream) {
   const hh = String(hostForUpstream || "").trim();
   if (!hh) return `127.0.0.1:${portForUpstream}`;
-  if (hh.includes(":") && !hh.startsWith("[::1]")) return hh;
+
+  // Already bracketed IPv6 like [::1]
+  if (hh.startsWith("[") && hh.includes("]")) return `${hh}:${portForUpstream}`;
+
+  // If it looks like IPv6, bracket it
+  if (hh.includes(":") && !hh.includes(".")) return `[${hh}]:${portForUpstream}`;
+
+  // If it already includes a port (ipv4:port), keep it
+  if (hh.includes(":")) return hh;
+
   return `${hh}:${portForUpstream}`;
 }
 
@@ -206,8 +216,12 @@ const forwardedProtoOverride = envStr("OPENCLAW_FORWARDED_PROTO", "");
 const forwardedHostOverride = envStr("OPENCLAW_FORWARDED_HOST", "");
 const upstreamHostHeaderOverride = envStr("OPENCLAW_UPSTREAM_HOST_HEADER", "");
 
-const bindPrimary = envStr("OPENCLAW_BIND", "loopback");
-const bindFallback = envStr("OPENCLAW_BIND_FALLBACK", "lan");
+const bindPrimaryEnv = envStr("OPENCLAW_BIND", "loopback");
+const bindFallbackEnv = envStr("OPENCLAW_BIND_FALLBACK", "lan");
+
+// FIX: if OpenClaw is the public listener, it cannot bind loopback on Railway
+const bindPrimary = openclawListenOnExternal ? "lan" : bindPrimaryEnv;
+const bindFallback = openclawListenOnExternal ? "lan" : bindFallbackEnv;
 
 const useShellForLocalBin = envBool("OPENCLAW_SHELL_LOCAL_BIN", true);
 
@@ -275,8 +289,6 @@ function buildSanitizedConfig() {
   ]);
   cfg.gateway.trustedProxies = trusted;
 
-  // Always set an explicit auth mode.
-  // This prevents builds that interpret missing auth as token mode.
   if (enforceTokenAuth && token) {
     cfg.gateway.auth = { mode: "token", token };
     console.log("[railway-start] gateway auth enabled (token)");
@@ -308,7 +320,6 @@ function buildCompatConfig() {
     delete base.gateway.pairingRequired;
   }
 
-  // Always set an explicit auth mode.
   if (enforceTokenAuth && token) {
     base.gateway.auth = base.gateway.auth || {};
     base.gateway.auth.mode = "token";
@@ -351,12 +362,6 @@ if (selfSanitize) {
 safeWriteJson(configA, configToWrite);
 safeWriteJson(configB, configToWrite);
 
-// Optional: write OpenClaw agent auth store if provided.
-// Priority:
-// 1) OPENCLAW_AUTH_PROFILES_JSON (raw JSON string)
-// 2) OPENCLAW_AUTH_PROFILES_B64  (base64 JSON)
-// 3) OPENAI_API_KEY              (auto-generate minimal auth-profiles.json)
-// 4) ANTHROPIC_API_KEY           (auto-generate minimal auth-profiles.json)
 (function writeAuthProfilesIfProvided() {
   const jsonRaw = envStr("OPENCLAW_AUTH_PROFILES_JSON", "").trim();
   const b64 = envStr("OPENCLAW_AUTH_PROFILES_B64", "").trim();
@@ -392,7 +397,6 @@ safeWriteJson(configB, configToWrite);
     return;
   }
 
-  // Auto generate minimal auth profiles from keys
   if (openaiKey || anthropicKey) {
     const authObj = {};
     if (openaiKey) authObj.openai = { apiKey: openaiKey };
@@ -938,11 +942,11 @@ function requestUpstream(req, res) {
   req.pipe(proxyReq);
 }
 
-// If OpenClaw binds to externalPort, do not start wrapper server (port collision).
 if (openclawListenOnExternal) {
   console.log("[railway-start] OPENCLAW_LISTEN_ON_EXTERNAL=1");
   console.log("[railway-start] wrapper HTTP server disabled to avoid EADDRINUSE");
   console.log("[railway-start] OpenClaw should serve /health /ready or its own endpoints");
+  console.log("[railway-start] forcing bind mode to lan for public reachability");
 
   setTimeout(() => startOpenClawLoop(), 0);
 
@@ -1056,7 +1060,6 @@ if (openclawListenOnExternal) {
     requestUpstream(req, res);
   });
 
-  // WebSocket upgrade proxy
   server.on("upgrade", async (req, socket, head) => {
     try {
       const url = req.url || "/";
