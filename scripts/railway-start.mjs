@@ -1109,7 +1109,7 @@ clawReady = false;
 
 restartAttempt += 1;
 const waitMs = computeBackoffMs(restartAttempt);
-scheduleRestart(waitMs);
+scheduleRestart(waitMs); // scheduleRestart already checks restartScheduled, safe from duplicates
 ```
 
 });
@@ -1532,8 +1532,8 @@ requestUpstream(req, res);
 
 // Avoid timeouts killing long-lived requests and websocket upgrades
 server.requestTimeout = 0;
-server.headersTimeout = Math.max(server.headersTimeout || 60000, 65000);
-server.keepAliveTimeout = Math.max(server.keepAliveTimeout || 5000, 65000);
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 70000; // Must be strictly > keepAliveTimeout to avoid Node warnings
 
 server.on(“error”, (e) => {
 console.error(”[railway-start] server error:”, e?.stack || e);
