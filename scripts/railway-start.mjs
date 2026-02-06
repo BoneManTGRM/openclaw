@@ -44,6 +44,11 @@
 //   - Auto-heal: if OpenClaw logs "Gateway auth is set to token, but no token is configured",
 //     we flip passGatewayTokenToChild to true for the next restart.
 //   - Control auto-heal with OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR=0 to disable.
+//
+// Additional fix in this update (token_mismatch on Control UI)
+// - When OPENCLAW_ENFORCE_TOKEN_AUTH=1, browsers often cannot add the required WS header.
+// - This wrapper injects the gateway token into upstream HTTP and WS requests so the UI works.
+//   Control with OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS=0 to disable.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -356,7 +361,6 @@ function matchesReadyExpect(statusCode, expectSpec) {
   if (expectSpec.mode === "2xx") return code >= 200 && code <= 299;
 
   if (expectSpec.mode === "any") {
-    // Treat any non-5xx as "serving something"
     return code >= 200 && code <= 499;
   }
 
@@ -378,6 +382,9 @@ const internalPort = openclawListenOnExternal ? externalPort : internalPortDefau
 
 const token = envStr("OPENCLAW_GATEWAY_TOKEN", "");
 const enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
+
+// Inject gateway token into upstream requests (fixes token_mismatch for Control UI)
+const injectGatewayTokenHeaders = envBool("OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS", true);
 
 // Auto-heal when OpenClaw complains auth token missing
 const autoPassTokenOnAuthError = envBool("OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR", true);
@@ -471,6 +478,7 @@ console.log(
   tokenFp.present ? `${tokenFp.sha256_8} (len ${tokenFp.len})` : "none"
 );
 console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
+console.log("[railway-start] inject gateway token headers =", injectGatewayTokenHeaders ? "yes" : "no");
 console.log("[railway-start] pass gateway token to child =", passGatewayTokenToChild ? "yes" : "no");
 console.log("[railway-start] autoPassTokenOnAuthError =", autoPassTokenOnAuthError ? "yes" : "no");
 console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" : "no");
@@ -814,10 +822,32 @@ function selectUpstreamAgent() {
   return upstreamProtocol === "https" ? proxyAgentHttps : proxyAgentHttp;
 }
 
+function applyGatewayTokenToHeaders(headers) {
+  if (!enforceTokenAuth) return headers;
+  if (!token) return headers;
+  if (!injectGatewayTokenHeaders) return headers;
+
+  const h = { ...(headers || {}) };
+
+  // Always force correct token upstream to prevent mismatches.
+  h["x-openclaw-token"] = token;
+  h["authorization"] = `Bearer ${token}`;
+
+  return h;
+}
+
 async function httpReadyCheckOnce(pathToCheck) {
   const client = selectUpstreamClient();
   const agent = selectUpstreamAgent();
   const insecure = envBool("OPENCLAW_UPSTREAM_INSECURE", false);
+
+  let headers = {
+    host: upstreamHostHeaderOverride || buildLocalHostHeader(upstreamHost, internalPort),
+    accept: "text/plain,application/json,*/*",
+    "user-agent": "railway-start-readycheck",
+  };
+
+  headers = applyGatewayTokenToHeaders(headers);
 
   const options = {
     agent,
@@ -825,11 +855,7 @@ async function httpReadyCheckOnce(pathToCheck) {
     port: internalPort,
     method: "GET",
     path: pathToCheck,
-    headers: {
-      host: upstreamHostHeaderOverride || buildLocalHostHeader(upstreamHost, internalPort),
-      accept: "text/plain,application/json,*/*",
-      "user-agent": "railway-start-readycheck",
-    },
+    headers,
     timeout: readyTimeoutMs,
   };
 
@@ -885,7 +911,6 @@ async function isOpenClawReadySignal() {
     }
   }
 
-  // Not ready on HTTP
   return {
     ok: false,
     detail: {
@@ -1254,11 +1279,10 @@ function buildForwardedHeaders(req) {
   if (selfSanitize) {
     const stripped = stripProxyDerivedHeaders(cleaned);
     stripped.host = cleaned.host || stripped.host || "";
-    return stripped;
+    return applyGatewayTokenToHeaders(stripped);
   }
 
-  // Normal mode: add forwarding headers
-  return {
+  const withForwarded = {
     ...cleaned,
     [H_XFP]: String(xfProto),
     [H_XFH]: String(xfHost),
@@ -1266,6 +1290,8 @@ function buildForwardedHeaders(req) {
     [H_XREAL]: String(remoteAddr),
     [H_XFPORT]: String(externalPort),
   };
+
+  return applyGatewayTokenToHeaders(withForwarded);
 }
 
 async function isOpenClawReadyFast() {
@@ -1288,7 +1314,8 @@ function serveText(res, code, text) {
 
 function requestUpstream(req, res) {
   const url = req.url || "/";
-  const headers = buildForwardedHeaders(req);
+  let headers = buildForwardedHeaders(req);
+  headers = applyGatewayTokenToHeaders(headers);
 
   const client = selectUpstreamClient();
   const agent = selectUpstreamAgent();
@@ -1305,7 +1332,6 @@ function requestUpstream(req, res) {
     timeout: proxyTimeoutMs,
   };
 
-  // Only https supports rejectUnauthorized
   if (upstreamProtocol === "https") {
     options.rejectUnauthorized = !insecure;
   }
@@ -1425,6 +1451,7 @@ if (openclawListenOnExternal) {
         stateDir,
 
         enforceTokenAuth,
+        injectGatewayTokenHeaders,
         passGatewayTokenToChild,
 
         autoPassTokenOnAuthError,
@@ -1520,7 +1547,8 @@ if (openclawListenOnExternal) {
         return;
       }
 
-      const headers = buildForwardedHeaders(req);
+      let headers = buildForwardedHeaders(req);
+      headers = applyGatewayTokenToHeaders(headers);
 
       const client = selectUpstreamClient();
       const agent = selectUpstreamAgent();
