@@ -24,10 +24,17 @@
 // - Hop-by-hop header set corrected to include "trailer" (not "trailers") and "proxy-connection".
 // - Response hop-by-hop filter matches the corrected set.
 //
-// NEW WS TOKEN FIX (pairing-required on Railway):
+// WS TOKEN FIX
 // - OpenClaw WS auth may read token from Sec-WebSocket-Protocol (subprotocol) and/or URL query (?token=...)
-// - This proxy now injects the server token into BOTH channels for upstream WS handshakes when childUsesTokenAuth.
-// - This fixes "pairing required" when the browser UI did not have a tokenized URL.
+// - This proxy can inject the server token into both channels for upstream WS handshakes when childUsesTokenAuth.
+// - SAFARI NOTE: Many iOS Safari builds are picky about custom subprotocols. Use OPENCLAW_WS_TOKEN_PROTOCOL_MODE=off.
+//
+// New knobs added by this update
+// - OPENCLAW_WS_TOKEN_PROTOCOL_MODE = off | single | multi
+//   off: do not modify Sec-WebSocket-Protocol (recommended for iOS Safari)
+//   single: inject one token subprotocol
+//   multi: inject several token subprotocol variants (maximum compatibility, can break picky clients)
+// - OPENCLAW_WS_FORCE_LOCAL_ORIGIN defaults to true now (safer for loopback upstream)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -461,8 +468,24 @@ const wsStripProxyHeaders = envBool("OPENCLAW_WS_STRIP_PROXY_HEADERS", true);
 // WS: force upstream Host to local loopback (default ON)
 const wsForceLocalHostHeader = envBool("OPENCLAW_WS_FORCE_LOCAL_HOST", true);
 
-// Optional: if enabled, rewrite Origin to local when upstream is loopback
-const wsForceLocalOrigin = envBool("OPENCLAW_WS_FORCE_LOCAL_ORIGIN", false);
+// Optional: rewrite Origin to local when upstream is loopback
+// Updated default: true (safer for loopback upstream on Railway)
+const wsForceLocalOrigin = envBool("OPENCLAW_WS_FORCE_LOCAL_ORIGIN", true);
+
+// WS token protocol injection mode
+// off: do not modify Sec-WebSocket-Protocol (recommended for iOS Safari)
+// single: add one protocol containing token
+// multi: add multiple variants (maximum compatibility, sometimes breaks picky clients)
+function normalizeWsTokenProtocolMode(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "off" || s === "none" || s === "0" || s === "false") return "off";
+  if (s === "single" || s === "one") return "single";
+  if (s === "multi" || s === "many") return "multi";
+  return "off";
+}
+const wsTokenProtocolMode = normalizeWsTokenProtocolMode(
+  envStr("OPENCLAW_WS_TOKEN_PROTOCOL_MODE", "off")
+);
 
 // OpenClaw expects bind MODEs here, not IPs.
 const bindPrimaryEnv = envStr("OPENCLAW_BIND", "loopback");
@@ -567,6 +590,7 @@ console.log("[railway-start] wsCloseDelayMs =", wsCloseDelayMs);
 console.log("[railway-start] wsStripProxyHeaders =", wsStripProxyHeaders ? "yes" : "no");
 console.log("[railway-start] wsForceLocalHostHeader =", wsForceLocalHostHeader ? "yes" : "no");
 console.log("[railway-start] wsForceLocalOrigin =", wsForceLocalOrigin ? "yes" : "no");
+console.log("[railway-start] wsTokenProtocolMode =", wsTokenProtocolMode);
 
 if (openclawListenOnExternal) {
   console.log("[railway-start] warning: OPENCLAW_LISTEN_ON_EXTERNAL=1 disables wrapper server");
@@ -1036,7 +1060,7 @@ function safeHeaderValue(v) {
 }
 
 // -----------------
-// WS token injection helpers (NEW)
+// WS token injection helpers
 // -----------------
 function parseWsSubprotocols(raw) {
   const s = String(raw || "");
@@ -1051,38 +1075,50 @@ function buildWsSubprotocolHeader(protocols) {
 }
 
 function injectGatewayTokenIntoWsHeaders(headersObj) {
-  // Only inject if we actually have a server token AND the child is using token auth
+  // Always allow header-based token injection (Authorization / x-clawdbot-token)
+  // Subprotocol token injection depends on wsTokenProtocolMode
   if (!token) return headersObj;
   if (!childUsesTokenAuth) return headersObj;
 
   const h = { ...(headersObj || {}) };
 
-  const existing = h["sec-websocket-protocol"] || "";
+  // Always add HTTP-style headers
+  const withHttpHeaders = applyGatewayTokenToHeaders(h);
+
+  if (wsTokenProtocolMode === "off") {
+    return withHttpHeaders;
+  }
+
+  const existing = withHttpHeaders["sec-websocket-protocol"] || "";
   const protocols = parseWsSubprotocols(existing);
 
   // Remove any stale token protocols
   const filtered = protocols.filter((p) => {
     const lp = p.toLowerCase();
-    return !lp.startsWith("openclaw-token.") &&
+    return (
+      !lp.startsWith("openclaw-token.") &&
       !lp.startsWith("gateway-token.") &&
       !lp.startsWith("clawdbot-token.") &&
-      !lp.startsWith("token.");
+      !lp.startsWith("token.")
+    );
   });
 
-  // Add multiple candidates for maximum compatibility across OpenClaw builds
-  filtered.push(`openclaw-token.${token}`);
-  filtered.push(`gateway-token.${token}`);
-  filtered.push(`clawdbot-token.${token}`);
-  filtered.push(`token.${token}`);
+  if (wsTokenProtocolMode === "single") {
+    filtered.push(`openclaw-token.${token}`);
+  } else {
+    // multi
+    filtered.push(`openclaw-token.${token}`);
+    filtered.push(`gateway-token.${token}`);
+    filtered.push(`clawdbot-token.${token}`);
+    filtered.push(`token.${token}`);
+  }
 
-  h["sec-websocket-protocol"] = buildWsSubprotocolHeader(filtered);
-
-  // Also keep HTTP-style headers for any builds that accept them on upgrade
-  return applyGatewayTokenToHeaders(h);
+  withHttpHeaders["sec-websocket-protocol"] = buildWsSubprotocolHeader(filtered);
+  return withHttpHeaders;
 }
 
 function injectGatewayTokenIntoUpstreamWsPath(urlRaw) {
-  // Also inject token into upstream ws URL query as a fallback
+  // Inject token into upstream ws URL query as a fallback
   if (!token) return String(urlRaw || "/") || "/";
   if (!childUsesTokenAuth) return String(urlRaw || "/") || "/";
   const raw = String(urlRaw || "/") || "/";
@@ -1456,12 +1492,12 @@ function buildForwardedHeaders(req, opts = {}) {
     };
 
     if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost) && rebuilt.origin) {
-      rebuilt.origin = `${xfProto}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
+      // Use upstreamProtocol here, not xfProto, to match what upstream sees
+      rebuilt.origin = `${upstreamProtocol}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
     }
 
     const noClientAuth = removeClientAuthHeaders(rebuilt);
 
-    // WS: inject token into subprotocol + headers (NEW)
     if (forWs) {
       return injectGatewayTokenIntoWsHeaders(noClientAuth);
     }
@@ -1490,12 +1526,11 @@ function buildForwardedHeaders(req, opts = {}) {
     };
 
     if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost) && rebuilt.origin) {
-      rebuilt.origin = `${xfProto}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
+      rebuilt.origin = `${upstreamProtocol}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
     }
 
     const noClientAuth = removeClientAuthHeaders(rebuilt);
 
-    // WS: inject token into subprotocol + headers (NEW)
     if (forWs) {
       return injectGatewayTokenIntoWsHeaders(noClientAuth);
     }
@@ -1513,12 +1548,11 @@ function buildForwardedHeaders(req, opts = {}) {
   };
 
   if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost) && withForwarded.origin) {
-    withForwarded.origin = `${xfProto}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
+    withForwarded.origin = `${upstreamProtocol}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
   }
 
   const noClientAuth = removeClientAuthHeaders(withForwarded);
 
-  // WS: inject token into subprotocol + headers (NEW)
   if (forWs) {
     return injectGatewayTokenIntoWsHeaders(noClientAuth);
   }
@@ -2073,6 +2107,7 @@ if (openclawListenOnExternal) {
         wsStripProxyHeaders,
         wsForceLocalHostHeader,
         wsForceLocalOrigin,
+        wsTokenProtocolMode,
 
         trustedProxies: trusted,
         outTail: outRing.slice(-120),
@@ -2174,13 +2209,13 @@ if (openclawListenOnExternal) {
       const isReady = await isOpenClawReadyFast();
       if (!isReady) return destroyBoth("upstream not ready");
 
-      // IMPORTANT: build upstream WS path:
+      // Build upstream WS path:
       // 1) rewrite any token-like params if present
       // 2) ensure ?token=... exists for upstream as fallback
       const urlRewritten = rewriteUrlTokenParams(urlRaw);
       const url = injectGatewayTokenIntoUpstreamWsPath(urlRewritten);
 
-      // Forwarded headers (already include WS token injection in buildForwardedHeaders when forWs=true)
+      // Forwarded headers (includes WS token injection when forWs=true)
       const headers = buildForwardedHeaders(req, { forWs: true });
 
       const client = selectUpstreamClient();
