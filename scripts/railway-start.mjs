@@ -26,8 +26,13 @@
 // 10) Cleanup: do not keep an idle interval around in external listen mode by default
 //     (set OPENCLAW_EXTERNAL_WATCHDOG=1 if you want the external mode watchdog).
 //
+// IMPORTANT FIX ADDED HERE (most common Railway issue):
+// - OpenClaw sometimes ignores OPENCLAW_STATE_DIR and reads config only from $HOME/.openclaw (or /home/node/.openclaw).
+// - This script now mirrors config and auth-profiles into BOTH the chosen writable stateDir AND any writable "standard" dirs.
+//   This prevents "proxy/trustedProxies/auth" fixes from silently not applying even though the script printed "wrote config".
+//
 // Applied updates in this revision
-// - Token auth headers: Authorization + X-Clawdbot-Token (plus optional compat headers)
+// - Mirror config/auth to standard dirs (HOME/.openclaw, /home/node/.openclaw, /data/.openclaw when writable)
 // - Improve WS stability: setNoDelay(true) on both sockets after upgrade
 // - Improve WS stability further: setNoDelay(true) on client socket as early as possible
 // - Harden destroyBoth(): attempt end() before destroy() to avoid stuck half-open sockets on mobile
@@ -577,11 +582,46 @@ if (openclawListenOnExternal) {
 
 safeMkdir(stateDir);
 
-const configA = path.join(stateDir, "openclaw.json");
-const configB = path.join(stateDir, "config.json");
+// NEW: build a set of "standard" dirs OpenClaw may read from, and mirror config there if writable.
+function computeMirrorDirs(primaryDir) {
+  const out = [];
+
+  const home = String(process.env.HOME || "").trim();
+  if (home) out.push(path.join(home, ".openclaw"));
+
+  // Common Railway/Node images
+  out.push("/home/node/.openclaw");
+  out.push("/data/.openclaw");
+
+  // Include primary
+  out.push(primaryDir);
+
+  // Only keep dirs we can write
+  const writable = [];
+  for (const d of uniq(out)) {
+    if (canWriteDir(d)) writable.push(d);
+  }
+  return uniq(writable);
+}
+
+const mirrorDirs = computeMirrorDirs(stateDir);
+
+console.log("[railway-start] config mirrorDirs =", mirrorDirs.join(", "));
+
+const configAName = "openclaw.json";
+const configBName = "config.json";
 
 // Read existing config (if any) then sanitize.
-const existing = readJsonIfExists(configA) || readJsonIfExists(configB) || {};
+const existing =
+  readJsonIfExists(path.join(stateDir, configAName)) ||
+  readJsonIfExists(path.join(stateDir, configBName)) ||
+  // Also try standard dirs in case stateDir differs from where OpenClaw last wrote
+  (mirrorDirs
+    .map((d) => readJsonIfExists(path.join(d, configAName)) || readJsonIfExists(path.join(d, configBName)))
+    .find(Boolean) ||
+    {}) ||
+  {};
+
 const existingGateway =
   typeof existing?.gateway === "object" && existing.gateway ? existing.gateway : {};
 
@@ -668,8 +708,12 @@ if (selfSanitize) {
   trusted = built.trusted;
 }
 
-safeWriteJson(configA, configToWrite);
-safeWriteJson(configB, configToWrite);
+// NEW: write config into all mirrorDirs so OpenClaw cannot "miss" the config.
+for (const d of mirrorDirs) {
+  safeMkdir(d);
+  safeWriteJson(path.join(d, configAName), configToWrite);
+  safeWriteJson(path.join(d, configBName), configToWrite);
+}
 
 // Optional: write OpenClaw agent auth store if provided.
 (function writeAuthProfilesIfProvided() {
@@ -685,34 +729,36 @@ safeWriteJson(configB, configToWrite);
     return;
   }
 
-  const agentAuthDir = path.join(stateDir, "agents", "main", "agent");
-  const authPath = path.join(agentAuthDir, "auth-profiles.json");
+  // NEW: mirror auth-profiles into every mirrorDir as well.
+  for (const baseDir of mirrorDirs) {
+    const agentAuthDir = path.join(baseDir, "agents", "main", "agent");
+    const authPath = path.join(agentAuthDir, "auth-profiles.json");
+    safeMkdir(agentAuthDir);
 
-  safeMkdir(agentAuthDir);
-
-  if (jsonRaw) {
-    console.log("[railway-start] writing auth-profiles.json from OPENCLAW_AUTH_PROFILES_JSON");
-    safeWriteText(authPath, jsonRaw);
-    return;
-  }
-
-  if (b64) {
-    console.log("[railway-start] writing auth-profiles.json from OPENCLAW_AUTH_PROFILES_B64");
-    try {
-      const buf = Buffer.from(b64, "base64");
-      safeWriteText(authPath, buf.toString("utf8"));
-    } catch (e) {
-      console.log(`[railway-start] failed to decode OPENCLAW_AUTH_PROFILES_B64: ${e?.message || e}`);
+    if (jsonRaw) {
+      console.log("[railway-start] writing auth-profiles.json from OPENCLAW_AUTH_PROFILES_JSON to", authPath);
+      safeWriteText(authPath, jsonRaw);
+      continue;
     }
-    return;
+
+    if (b64) {
+      console.log("[railway-start] writing auth-profiles.json from OPENCLAW_AUTH_PROFILES_B64 to", authPath);
+      try {
+        const buf = Buffer.from(b64, "base64");
+        safeWriteText(authPath, buf.toString("utf8"));
+      } catch (e) {
+        console.log(`[railway-start] failed to decode OPENCLAW_AUTH_PROFILES_B64: ${e?.message || e}`);
+      }
+      continue;
+    }
+
+    const authObj = {};
+    if (openaiKey) authObj.openai = { apiKey: openaiKey };
+    if (anthropicKey) authObj.anthropic = { apiKey: anthropicKey };
+
+    console.log("[railway-start] auto-generating auth-profiles.json from API key env vars to", authPath);
+    safeWriteJson(authPath, authObj);
   }
-
-  const authObj = {};
-  if (openaiKey) authObj.openai = { apiKey: openaiKey };
-  if (anthropicKey) authObj.anthropic = { apiKey: anthropicKey };
-
-  console.log("[railway-start] auto-generating auth-profiles.json from API key env vars");
-  safeWriteJson(authPath, authObj);
 })();
 
 // -----------------
@@ -834,7 +880,15 @@ function currentBindForAttempt(attempt) {
 }
 
 function spawnOpenClawProcess(bindMode) {
-  const childEnv = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+  const childEnv = { ...process.env };
+
+  // Primary state dir
+  childEnv.OPENCLAW_STATE_DIR = stateDir;
+
+  // NEW: also provide a couple of common alias env vars (harmless if ignored)
+  // This helps forks/builds that look for "config dir" rather than "state dir".
+  childEnv.OPENCLAW_CONFIG_DIR = stateDir;
+  childEnv.OPENCLAW_HOME_DIR = stateDir;
 
   if (passGatewayTokenToChild && token) {
     childEnv.OPENCLAW_GATEWAY_TOKEN = token;
@@ -1757,6 +1811,7 @@ if (openclawListenOnExternal) {
         readyDetail: sig.detail,
 
         stateDir,
+        mirrorDirs,
 
         enforceTokenAuth,
         injectGatewayTokenHeaders,
@@ -1921,6 +1976,7 @@ if (openclawListenOnExternal) {
         } catch {}
       });
 
+      socket.on("timeout", () => destroyBoth("client socket timeout"));
       socket.on("error", () => destroyBoth("client socket error"));
       socket.on("end", () => destroyBoth("client socket ended"));
       socket.on("close", () => {
@@ -1980,7 +2036,7 @@ if (openclawListenOnExternal) {
 
         const safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers);
         const lines = [
-          `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${
+          `HTTP/${upstreamRes.httpVersion || "1.1"} ${upstreamRes.statusCode} ${
             upstreamRes.statusMessage || ""
           }`.trim(),
           ...headersToLines(safeHeaders),
@@ -2001,6 +2057,7 @@ if (openclawListenOnExternal) {
           } catch {}
         }
 
+        upstreamSocket.on("timeout", () => destroyBoth("upstream socket timeout"));
         upstreamSocket.on("error", () => destroyBoth("upstream socket error"));
         upstreamSocket.on("end", () => destroyBoth("upstream socket ended"));
         upstreamSocket.on("close", () => destroyBoth("upstream socket closed"));
@@ -2009,7 +2066,9 @@ if (openclawListenOnExternal) {
           socket.resume();
         } catch {}
 
-        socket.pipe(upstreamSocket).pipe(socket);
+        // Pipe both ways (same behavior, just not chained for easier debugging)
+        socket.pipe(upstreamSocket);
+        upstreamSocket.pipe(socket);
       });
 
       upstreamReq.on("timeout", () => destroyBoth("upstream request timeout"));
