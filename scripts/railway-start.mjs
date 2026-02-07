@@ -23,6 +23,11 @@
 // - Mirror dirs now include /root/.openclaw (some Railway images run as root).
 // - Hop-by-hop header set corrected to include "trailer" (not "trailers") and "proxy-connection".
 // - Response hop-by-hop filter matches the corrected set.
+//
+// NEW WS TOKEN FIX (pairing-required on Railway):
+// - OpenClaw WS auth may read token from Sec-WebSocket-Protocol (subprotocol) and/or URL query (?token=...)
+// - This proxy now injects the server token into BOTH channels for upstream WS handshakes when childUsesTokenAuth.
+// - This fixes "pairing required" when the browser UI did not have a tokenized URL.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -1030,6 +1035,66 @@ function safeHeaderValue(v) {
   return s.replace(/[\r\n]+/g, " ").trim();
 }
 
+// -----------------
+// WS token injection helpers (NEW)
+// -----------------
+function parseWsSubprotocols(raw) {
+  const s = String(raw || "");
+  return s
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function buildWsSubprotocolHeader(protocols) {
+  return uniq(protocols).join(", ");
+}
+
+function injectGatewayTokenIntoWsHeaders(headersObj) {
+  // Only inject if we actually have a server token AND the child is using token auth
+  if (!token) return headersObj;
+  if (!childUsesTokenAuth) return headersObj;
+
+  const h = { ...(headersObj || {}) };
+
+  const existing = h["sec-websocket-protocol"] || "";
+  const protocols = parseWsSubprotocols(existing);
+
+  // Remove any stale token protocols
+  const filtered = protocols.filter((p) => {
+    const lp = p.toLowerCase();
+    return !lp.startsWith("openclaw-token.") &&
+      !lp.startsWith("gateway-token.") &&
+      !lp.startsWith("clawdbot-token.") &&
+      !lp.startsWith("token.");
+  });
+
+  // Add multiple candidates for maximum compatibility across OpenClaw builds
+  filtered.push(`openclaw-token.${token}`);
+  filtered.push(`gateway-token.${token}`);
+  filtered.push(`clawdbot-token.${token}`);
+  filtered.push(`token.${token}`);
+
+  h["sec-websocket-protocol"] = buildWsSubprotocolHeader(filtered);
+
+  // Also keep HTTP-style headers for any builds that accept them on upgrade
+  return applyGatewayTokenToHeaders(h);
+}
+
+function injectGatewayTokenIntoUpstreamWsPath(urlRaw) {
+  // Also inject token into upstream ws URL query as a fallback
+  if (!token) return String(urlRaw || "/") || "/";
+  if (!childUsesTokenAuth) return String(urlRaw || "/") || "/";
+  const raw = String(urlRaw || "/") || "/";
+  try {
+    const u = new URL(raw, "http://local.invalid");
+    if (!u.searchParams.get("token")) u.searchParams.set("token", token);
+    return `${u.pathname}${u.search}${u.hash}`;
+  } catch {
+    return raw;
+  }
+}
+
 async function httpReadyCheckOnce(pathToCheck, opts = {}) {
   const client = selectUpstreamClient();
   const agent = selectUpstreamAgent();
@@ -1395,6 +1460,12 @@ function buildForwardedHeaders(req, opts = {}) {
     }
 
     const noClientAuth = removeClientAuthHeaders(rebuilt);
+
+    // WS: inject token into subprotocol + headers (NEW)
+    if (forWs) {
+      return injectGatewayTokenIntoWsHeaders(noClientAuth);
+    }
+
     return applyGatewayTokenToHeaders(noClientAuth);
   }
 
@@ -1423,6 +1494,12 @@ function buildForwardedHeaders(req, opts = {}) {
     }
 
     const noClientAuth = removeClientAuthHeaders(rebuilt);
+
+    // WS: inject token into subprotocol + headers (NEW)
+    if (forWs) {
+      return injectGatewayTokenIntoWsHeaders(noClientAuth);
+    }
+
     return applyGatewayTokenToHeaders(noClientAuth);
   }
 
@@ -1440,6 +1517,12 @@ function buildForwardedHeaders(req, opts = {}) {
   }
 
   const noClientAuth = removeClientAuthHeaders(withForwarded);
+
+  // WS: inject token into subprotocol + headers (NEW)
+  if (forWs) {
+    return injectGatewayTokenIntoWsHeaders(noClientAuth);
+  }
+
   return applyGatewayTokenToHeaders(noClientAuth);
 }
 
@@ -2091,7 +2174,13 @@ if (openclawListenOnExternal) {
       const isReady = await isOpenClawReadyFast();
       if (!isReady) return destroyBoth("upstream not ready");
 
-      const url = rewriteUrlTokenParams(urlRaw);
+      // IMPORTANT: build upstream WS path:
+      // 1) rewrite any token-like params if present
+      // 2) ensure ?token=... exists for upstream as fallback
+      const urlRewritten = rewriteUrlTokenParams(urlRaw);
+      const url = injectGatewayTokenIntoUpstreamWsPath(urlRewritten);
+
+      // Forwarded headers (already include WS token injection in buildForwardedHeaders when forWs=true)
       const headers = buildForwardedHeaders(req, { forWs: true });
 
       const client = selectUpstreamClient();
