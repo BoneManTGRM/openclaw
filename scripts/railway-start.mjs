@@ -17,7 +17,7 @@
 // 2) Adaptive flag fallback: if OpenClaw does not support flags like --no-doctor or --allow-unconfigured,
 //    we detect "unknown option" and restart without the offending flag.
 // 3) Token injection is based on actual child token usage, not only OPENCLAW_ENFORCE_TOKEN_AUTH.
-// 4) Readiness checks inject the token when the child is using token auth.
+// 4) Readiness checks inject the token when the child is using token auth (and can auto-detect 401/403).
 // 5) Proxy response headers are cleaned for hop-by-hop headers to avoid weirdness with some clients.
 // 6) Hardening around remoteAddress formatting and forwarded header sanitization.
 // 7) Safety: if enforce token auth is enabled but token is missing, auto disable it with a warning.
@@ -187,6 +187,7 @@ function tcpCheck(host, port, timeoutMs = 800) {
     sock.on("timeout", () => done(false));
     sock.on("error", () => done(false));
 
+    // Important: do not fail on close if we already connected successfully.
     sock.on("close", () => {
       if (!connected) done(false);
     });
@@ -417,6 +418,11 @@ const autoPassTokenOnAuthError = envBool("OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR
 let passGatewayTokenToChild =
   enforceTokenAuth || envBool("OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD", false);
 
+// Runtime: whether the current child is actually using token auth.
+// This is used to decide whether to inject token headers into upstream requests.
+// It can be auto-detected via readiness 401/403 or logs.
+let childUsesTokenAuth = !!(enforceTokenAuth || passGatewayTokenToChild);
+
 // Safety: if enforceTokenAuth was requested but token is missing, disable it
 if (enforceTokenAuth && !token) {
   enforceTokenAuth = false;
@@ -426,6 +432,7 @@ if (enforceTokenAuth && !token) {
   console.log("[railway-start] warning: disabling enforceTokenAuth to avoid broken auth config");
 
   passGatewayTokenToChild = envBool("OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD", false);
+  childUsesTokenAuth = !!passGatewayTokenToChild;
 }
 
 // Self sanitize config to a strict minimal object that cannot contain unknown keys.
@@ -542,6 +549,7 @@ console.log(
 console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
 console.log("[railway-start] inject gateway token headers =", injectGatewayTokenHeaders ? "yes" : "no");
 console.log("[railway-start] pass gateway token to child =", passGatewayTokenToChild ? "yes" : "no");
+console.log("[railway-start] childUsesTokenAuth =", childUsesTokenAuth ? "yes" : "no");
 console.log("[railway-start] tokenHeaderCompat =", tokenHeaderCompat ? "yes" : "no");
 console.log("[railway-start] legacyGatewayTokenHeader =", legacyGatewayTokenHeader ? "yes" : "no");
 if (passGatewayTokenToChild && !token) {
@@ -885,7 +893,7 @@ function spawnOpenClawProcess(bindMode) {
   // Primary state dir
   childEnv.OPENCLAW_STATE_DIR = stateDir;
 
-  // NEW: also provide a couple of common alias env vars (harmless if ignored)
+  // Also provide a couple of common alias env vars (harmless if ignored)
   // This helps forks/builds that look for "config dir" rather than "state dir".
   childEnv.OPENCLAW_CONFIG_DIR = stateDir;
   childEnv.OPENCLAW_HOME_DIR = stateDir;
@@ -907,6 +915,10 @@ function spawnOpenClawProcess(bindMode) {
   }
 
   const args = [...resolved.argsPrefix, ...buildOpenClawArgs(bindMode)];
+
+  // Update runtime auth mode based on the actual args we are about to use.
+  // If args include "--token", the child will enforce token auth.
+  childUsesTokenAuth = args.includes("--token") && !!token ? true : !!enforceTokenAuth;
 
   if (resolved.kind === "localbin" && useShellForLocalBin) {
     const cmdLine = shJoin(resolved.cmd, args);
@@ -954,9 +966,7 @@ function selectUpstreamAgent() {
 function shouldInjectGatewayToken() {
   if (!token) return false;
   if (!injectGatewayTokenHeaders) return false;
-  if (enforceTokenAuth) return true;
-  if (passGatewayTokenToChild) return true;
-  return false;
+  return !!childUsesTokenAuth;
 }
 
 function applyGatewayTokenToHeaders(headers) {
@@ -978,12 +988,23 @@ function applyGatewayTokenToHeaders(headers) {
   return h;
 }
 
+// Force token headers regardless of childUsesTokenAuth (used only in detection paths).
+function applyGatewayTokenToHeadersForced(headers) {
+  if (!token) return headers;
+  const h = { ...(headers || {}) };
+  h["authorization"] = `Bearer ${token}`;
+  h["x-clawdbot-token"] = token;
+  if (tokenHeaderCompat) h["x-openclaw-token"] = token;
+  if (legacyGatewayTokenHeader) h["x-openclaw-gateway-token"] = token;
+  return h;
+}
+
 function safeHeaderValue(v) {
   const s = headerValueToString(v);
   return s.replace(/[\r\n]+/g, " ").trim();
 }
 
-async function httpReadyCheckOnce(pathToCheck) {
+async function httpReadyCheckOnce(pathToCheck, opts = {}) {
   const client = selectUpstreamClient();
   const agent = selectUpstreamAgent();
 
@@ -993,7 +1014,7 @@ async function httpReadyCheckOnce(pathToCheck) {
     "user-agent": "railway-start-readycheck",
   };
 
-  headers = applyGatewayTokenToHeaders(headers);
+  headers = opts.forceToken ? applyGatewayTokenToHeadersForced(headers) : applyGatewayTokenToHeaders(headers);
 
   const options = {
     agent,
@@ -1035,12 +1056,27 @@ async function isOpenClawReadySignal() {
   const r = await isPortReadyAnyHost();
   if (!r.ok) return { ok: false, detail: r };
 
+  // First try with current token injection decision.
   const first = await httpReadyCheckOnce(readyPath);
   if (first.ok) {
     return {
       ok: true,
       detail: { ...r, http: true, path: first.path, code: first.code, expect: readyExpectRaw },
     };
+  }
+
+  // Auto-detect token auth if upstream returns 401/403 and we have a token but are not currently injecting.
+  // Then retry once with forced token headers.
+  if ((first.code === 401 || first.code === 403) && token && injectGatewayTokenHeaders && !childUsesTokenAuth) {
+    const forced = await httpReadyCheckOnce(readyPath, { forceToken: true });
+    if (forced.ok) {
+      childUsesTokenAuth = true;
+      console.log("[railway-start] readiness detected token auth (401/403), enabling childUsesTokenAuth");
+      return {
+        ok: true,
+        detail: { ...r, http: true, path: forced.path, code: forced.code, expect: readyExpectRaw, autoToken: true },
+      };
+    }
   }
 
   for (const p of readyFallbackPaths) {
@@ -1051,6 +1087,18 @@ async function isOpenClawReadySignal() {
         ok: true,
         detail: { ...r, http: true, path: chk.path, code: chk.code, expect: readyExpectRaw },
       };
+    }
+
+    if ((chk.code === 401 || chk.code === 403) && token && injectGatewayTokenHeaders && !childUsesTokenAuth) {
+      const forced = await httpReadyCheckOnce(p, { forceToken: true });
+      if (forced.ok) {
+        childUsesTokenAuth = true;
+        console.log("[railway-start] readiness detected token auth (401/403), enabling childUsesTokenAuth");
+        return {
+          ok: true,
+          detail: { ...r, http: true, path: forced.path, code: forced.code, expect: readyExpectRaw, autoToken: true },
+        };
+      }
     }
   }
 
@@ -1410,6 +1458,14 @@ function requestUpstream(req, res) {
   }
 
   const proxyReq = client.request(options, (proxyRes) => {
+    // If upstream says 401/403 and we have a token but were not injecting because childUsesTokenAuth was false,
+    // enable it for future requests.
+    const sc = Number(proxyRes.statusCode || 0);
+    if ((sc === 401 || sc === 403) && token && injectGatewayTokenHeaders && !childUsesTokenAuth) {
+      childUsesTokenAuth = true;
+      console.log("[railway-start] upstream returned 401/403, enabling childUsesTokenAuth for future requests");
+    }
+
     const safeHeaders = filterHopByHopResponseHeaders(proxyRes.headers);
     res.writeHead(proxyRes.statusCode || 502, safeHeaders);
 
@@ -1566,6 +1622,15 @@ async function startOpenClawLoop() {
     return false;
   };
 
+  const noteChildUsesToken = (why) => {
+    if (!token) return;
+    if (!injectGatewayTokenHeaders) return;
+    if (!childUsesTokenAuth) {
+      childUsesTokenAuth = true;
+      console.log("[railway-start] enabling childUsesTokenAuth due to:", why);
+    }
+  };
+
   if (claw.stdout) {
     claw.stdout.on("data", (data) => {
       const lines = data
@@ -1579,8 +1644,11 @@ async function startOpenClawLoop() {
 
         if (handleUnknownFlagMaybe(ln)) return;
 
+        // If OpenClaw logs imply token mode, ensure we inject token on proxy and readiness.
+        const low = String(ln || "").toLowerCase();
+        if (low.includes("auth") && low.includes("token")) noteChildUsesToken("stdout indicates token auth");
+
         if (token && !injectGatewayTokenHeaders) {
-          const low = String(ln || "").toLowerCase();
           if (low.includes("token_mismatch") || low.includes("token mismatch")) {
             injectGatewayTokenHeaders = true;
             console.log("[railway-start] detected token mismatch log; enabling injectGatewayTokenHeaders");
@@ -1605,25 +1673,32 @@ async function startOpenClawLoop() {
 
         if (handleUnknownFlagMaybe(ln)) return;
 
+        const low = String(ln || "").toLowerCase();
+
         if (autoPassTokenOnAuthError && !passGatewayTokenToChild && token) {
-          const low = String(ln || "").toLowerCase();
           const hit =
             low.includes("gateway auth is set to token") &&
             (low.includes("no token is configured") || low.includes("set gateway.auth.token"));
 
           if (hit) {
             passGatewayTokenToChild = true;
+            noteChildUsesToken("stderr auth missing suggests token mode");
             console.log(
               "[railway-start] detected auth token missing; enabling passGatewayTokenToChild for next restart"
             );
           }
         }
 
-        if (token && !injectGatewayTokenHeaders) {
-          const low = String(ln || "").toLowerCase();
+        // If OpenClaw is in token mode (or complains about tokens), inject in proxy path.
+        if (low.includes("token")) {
           if (low.includes("token_mismatch") || low.includes("token mismatch")) {
-            injectGatewayTokenHeaders = true;
-            console.log("[railway-start] detected token mismatch; enabling injectGatewayTokenHeaders");
+            if (token && !injectGatewayTokenHeaders) {
+              injectGatewayTokenHeaders = true;
+              console.log("[railway-start] detected token mismatch; enabling injectGatewayTokenHeaders");
+            }
+            noteChildUsesToken("token mismatch log");
+          } else if (low.includes("auth") && low.includes("token")) {
+            noteChildUsesToken("stderr indicates token auth");
           }
         }
       }
@@ -1828,6 +1903,7 @@ if (openclawListenOnExternal) {
         enforceTokenAuth,
         injectGatewayTokenHeaders,
         passGatewayTokenToChild,
+        childUsesTokenAuth,
 
         tokenHeaderCompat,
         legacyGatewayTokenHeader,
