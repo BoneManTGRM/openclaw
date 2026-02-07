@@ -768,9 +768,6 @@ let claw = null;
 let clawStarting = false;
 let clawReady = false;
 
-// NEW: tracks observed token usage in the child, so we inject headers when actually needed
-let childUsingTokenAuth = false;
-
 let restartAttempt = 0;
 let startLoopId = 0;
 let restartScheduled = false;
@@ -909,12 +906,7 @@ function spawnOpenClawProcess(bindMode) {
     );
   }
 
-  const builtArgs = buildOpenClawArgs(bindMode);
-
-  // NEW: mark child as token-auth if we are starting it with token auth
-  childUsingTokenAuth = !!(enforceTokenAuth && token) || (builtArgs.includes("--token") && !!token);
-
-  const args = [...resolved.argsPrefix, ...builtArgs];
+  const args = [...resolved.argsPrefix, ...buildOpenClawArgs(bindMode)];
 
   if (resolved.kind === "localbin" && useShellForLocalBin) {
     const cmdLine = shJoin(resolved.cmd, args);
@@ -962,10 +954,6 @@ function selectUpstreamAgent() {
 function shouldInjectGatewayToken() {
   if (!token) return false;
   if (!injectGatewayTokenHeaders) return false;
-
-  // NEW: also inject if we observed or inferred that the child uses token auth
-  if (childUsingTokenAuth) return true;
-
   if (enforceTokenAuth) return true;
   if (passGatewayTokenToChild) return true;
   return false;
@@ -993,21 +981,6 @@ function applyGatewayTokenToHeaders(headers) {
 function safeHeaderValue(v) {
   const s = headerValueToString(v);
   return s.replace(/[\r\n]+/g, " ").trim();
-}
-
-// NEW: detect token-required patterns in logs to flip childUsingTokenAuth and enable injection
-function detectTokenRequiredLine(line) {
-  const low = String(line || "").toLowerCase();
-  if (!low) return false;
-
-  // Keep these broad because forks vary wording
-  if (low.includes("token_mismatch") || low.includes("token mismatch")) return true;
-  if (low.includes("unauthorized") || low.includes("authorization")) return true;
-  if (low.includes("missing token") || low.includes("token required")) return true;
-  if (low.includes("gateway auth is set to token")) return true;
-  if (low.includes("set gateway.auth.token") || low.includes("no token is configured")) return true;
-
-  return false;
 }
 
 async function httpReadyCheckOnce(pathToCheck) {
@@ -1394,10 +1367,22 @@ function serveText(res, code, text) {
   res.end(text);
 }
 
-function filterHopByHopResponseHeaders(headers) {
+/**
+ * Filter hop-by-hop headers for normal HTTP proxying.
+ * For WebSocket handshake responses we must keep Connection and Upgrade.
+ */
+function filterHopByHopResponseHeaders(headers, opts = {}) {
+  const keepWsHandshake = !!opts.keepWsHandshake;
   const out = {};
   for (const [k, v] of Object.entries(headers || {})) {
-    if (HOP_BY_HOP.has(String(k).toLowerCase())) continue;
+    const lk = String(k).toLowerCase();
+    if (HOP_BY_HOP.has(lk)) {
+      if (keepWsHandshake && (lk === "connection" || lk === "upgrade")) {
+        out[k] = v;
+        continue;
+      }
+      continue;
+    }
     out[k] = v;
   }
   return out;
@@ -1533,9 +1518,6 @@ async function startOpenClawLoop() {
   clawStarting = true;
   clawReady = false;
 
-  // NEW: reset observed token state at start; spawnOpenClawProcess can set it true if needed
-  childUsingTokenAuth = !!(enforceTokenAuth && token) || !!(passGatewayTokenToChild && token);
-
   outRing.length = 0;
   errRing.length = 0;
 
@@ -1584,21 +1566,6 @@ async function startOpenClawLoop() {
     return false;
   };
 
-  const handleTokenNeedMaybe = (ln) => {
-    if (!token) return;
-    if (!detectTokenRequiredLine(ln)) return;
-
-    if (!childUsingTokenAuth) {
-      childUsingTokenAuth = true;
-      console.log("[railway-start] detected token auth requirement from logs; enabling token injection");
-    }
-
-    if (!injectGatewayTokenHeaders) {
-      injectGatewayTokenHeaders = true;
-      console.log("[railway-start] enabling injectGatewayTokenHeaders due to auth-related logs");
-    }
-  };
-
   if (claw.stdout) {
     claw.stdout.on("data", (data) => {
       const lines = data
@@ -1612,7 +1579,13 @@ async function startOpenClawLoop() {
 
         if (handleUnknownFlagMaybe(ln)) return;
 
-        handleTokenNeedMaybe(ln);
+        if (token && !injectGatewayTokenHeaders) {
+          const low = String(ln || "").toLowerCase();
+          if (low.includes("token_mismatch") || low.includes("token mismatch")) {
+            injectGatewayTokenHeaders = true;
+            console.log("[railway-start] detected token mismatch log; enabling injectGatewayTokenHeaders");
+          }
+        }
       }
     });
     claw.stdout.on("end", () => console.log("[railway-start] child stdout ended"));
@@ -1632,8 +1605,6 @@ async function startOpenClawLoop() {
 
         if (handleUnknownFlagMaybe(ln)) return;
 
-        handleTokenNeedMaybe(ln);
-
         if (autoPassTokenOnAuthError && !passGatewayTokenToChild && token) {
           const low = String(ln || "").toLowerCase();
           const hit =
@@ -1645,6 +1616,14 @@ async function startOpenClawLoop() {
             console.log(
               "[railway-start] detected auth token missing; enabling passGatewayTokenToChild for next restart"
             );
+          }
+        }
+
+        if (token && !injectGatewayTokenHeaders) {
+          const low = String(ln || "").toLowerCase();
+          if (low.includes("token_mismatch") || low.includes("token mismatch")) {
+            injectGatewayTokenHeaders = true;
+            console.log("[railway-start] detected token mismatch; enabling injectGatewayTokenHeaders");
           }
         }
       }
@@ -1849,7 +1828,6 @@ if (openclawListenOnExternal) {
         enforceTokenAuth,
         injectGatewayTokenHeaders,
         passGatewayTokenToChild,
-        childUsingTokenAuth,
 
         tokenHeaderCompat,
         legacyGatewayTokenHeader,
@@ -2068,7 +2046,12 @@ if (openclawListenOnExternal) {
           upstreamSocket.setKeepAlive(true);
         } catch {}
 
-        const safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers);
+        // IMPORTANT: keep Connection and Upgrade on WS handshake response
+        const safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers, { keepWsHandshake: true });
+        // Force required headers in case upstream response omits them
+        safeHeaders.connection = safeHeaders.connection || "Upgrade";
+        safeHeaders.upgrade = safeHeaders.upgrade || "websocket";
+
         const lines = [
           `HTTP/${upstreamRes.httpVersion || "1.1"} ${upstreamRes.statusCode} ${
             upstreamRes.statusMessage || ""
