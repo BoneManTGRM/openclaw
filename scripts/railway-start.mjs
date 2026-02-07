@@ -33,6 +33,7 @@
 // - Improve WS stability further: setNoDelay(true) on client socket as early as possible
 // - Harden destroyBoth(): attempt end() before destroy() to avoid stuck half-open sockets on mobile
 // - Add gentle delays between end() and destroy() to reduce Safari "closed before connect" incidence
+// - Optional: OPENCLAW_WS_FORCE_LOCAL_ORIGIN=1 can rewrite Origin to local in loopback upstream
 //
 // FIX FOR YOUR CURRENT LOGS (Loopback connection with non-local Host header)
 // Your logs show:
@@ -136,9 +137,7 @@ function canWriteDir(dir) {
 
 function parseTrustedProxies() {
   const trustAll = envBool("OPENCLAW_TRUST_ALL_PROXIES", false);
-  if (trustAll) {
-    return ["0.0.0.0/0", "::/0"];
-  }
+  if (trustAll) return ["0.0.0.0/0", "::/0"];
 
   const override = String(process.env.OPENCLAW_TRUSTED_PROXIES || "").trim();
 
@@ -381,10 +380,7 @@ function matchesReadyExpect(statusCode, expectSpec) {
   if (!Number.isFinite(code)) return false;
 
   if (expectSpec.mode === "2xx") return code >= 200 && code <= 299;
-
-  if (expectSpec.mode === "any") {
-    return code >= 200 && code <= 499;
-  }
+  if (expectSpec.mode === "any") return code >= 200 && code <= 499;
 
   const str = String(code);
   return expectSpec.exact?.has(str) || false;
@@ -476,6 +472,9 @@ const wsStripProxyHeaders = envBool("OPENCLAW_WS_STRIP_PROXY_HEADERS", true);
 // WS: force upstream Host to local loopback (default ON, fixes your log)
 const wsForceLocalHostHeader = envBool("OPENCLAW_WS_FORCE_LOCAL_HOST", true);
 
+// Optional: if enabled, rewrite Origin to local when upstream is loopback
+const wsForceLocalOrigin = envBool("OPENCLAW_WS_FORCE_LOCAL_ORIGIN", false);
+
 // OpenClaw expects bind MODEs here, not IPs.
 const bindPrimaryEnv = envStr("OPENCLAW_BIND", "loopback");
 const bindFallbackEnv = envStr("OPENCLAW_BIND_FALLBACK", "lan");
@@ -566,6 +565,7 @@ console.log("[railway-start] upstreamForceLocalHostHeader =", upstreamForceLocal
 console.log("[railway-start] wsCloseDelayMs =", wsCloseDelayMs);
 console.log("[railway-start] wsStripProxyHeaders =", wsStripProxyHeaders ? "yes" : "no");
 console.log("[railway-start] wsForceLocalHostHeader =", wsForceLocalHostHeader ? "yes" : "no");
+console.log("[railway-start] wsForceLocalOrigin =", wsForceLocalOrigin ? "yes" : "no");
 
 if (openclawListenOnExternal) {
   console.log("[railway-start] warning: OPENCLAW_LISTEN_ON_EXTERNAL=1 disables wrapper server");
@@ -804,9 +804,7 @@ function resolveOpenClawCommand() {
 function buildOpenClawArgs(bindMode) {
   const args = ["gateway", "--bind", String(bindMode), "--port", String(internalPort)];
 
-  if (flagAllowUnconfigured) {
-    args.push("--allow-unconfigured");
-  }
+  if (flagAllowUnconfigured) args.push("--allow-unconfigured");
 
   if (passGatewayTokenToChild) {
     if (token) {
@@ -824,9 +822,7 @@ function buildOpenClawArgs(bindMode) {
     console.log("[railway-start] OPENCLAW_FORCE=1 requested but lsof is missing, skipping --force");
   }
 
-  if (flagNoDoctor) {
-    args.push("--no-doctor");
-  }
+  if (flagNoDoctor) args.push("--no-doctor");
 
   return args;
 }
@@ -1135,14 +1131,9 @@ function pickHostHeaderForUpstream(req, xfHost) {
   const inboundHost = req.headers?.host || "";
   const candidate = String(xfHost || inboundHost || "").trim();
 
-  // If missing, always provide a safe Host header to upstream
-  if (!candidate) {
-    return buildLocalHostHeader(upstreamHost, internalPort);
-  }
+  if (!candidate) return buildLocalHostHeader(upstreamHost, internalPort);
 
-  if (!upstreamForceLocalHostHeader) {
-    return candidate;
-  }
+  if (!upstreamForceLocalHostHeader) return candidate;
 
   const inboundIsLocal = isLocalHostHeader(inboundHost);
   if (isLoopbackHost(upstreamHost) && !inboundIsLocal) {
@@ -1241,6 +1232,10 @@ function buildForwardedHeaders(req, opts = {}) {
       [H_XFPORT]: String(externalPort),
     };
 
+    if (wsForceLocalOrigin && isLoopbackHost(upstreamHost) && rebuilt.origin) {
+      rebuilt.origin = `${xfProto}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
+    }
+
     return applyGatewayTokenToHeaders(rebuilt);
   }
 
@@ -1265,6 +1260,10 @@ function buildForwardedHeaders(req, opts = {}) {
       [H_XFPORT]: String(externalPort),
     };
 
+    if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost) && rebuilt.origin) {
+      rebuilt.origin = `${xfProto}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
+    }
+
     return applyGatewayTokenToHeaders(rebuilt);
   }
 
@@ -1276,6 +1275,10 @@ function buildForwardedHeaders(req, opts = {}) {
     ...(remoteAddr ? { [H_XREAL]: String(remoteAddr) } : {}),
     [H_XFPORT]: String(externalPort),
   };
+
+  if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost) && withForwarded.origin) {
+    withForwarded.origin = `${xfProto}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
+  }
 
   return applyGatewayTokenToHeaders(withForwarded);
 }
@@ -1776,6 +1779,7 @@ if (openclawListenOnExternal) {
         wsCloseDelayMs,
         wsStripProxyHeaders,
         wsForceLocalHostHeader,
+        wsForceLocalOrigin,
 
         trustedProxies: trusted,
         outTail: outRing.slice(-120),
@@ -1903,6 +1907,7 @@ if (openclawListenOnExternal) {
       });
 
       socket.on("error", () => destroyBoth("client socket error"));
+      socket.on("end", () => destroyBoth("client socket ended"));
       socket.on("close", () => {
         if (!upgraded) destroyBoth("client socket closed before upgrade complete");
       });
@@ -1982,6 +1987,7 @@ if (openclawListenOnExternal) {
         }
 
         upstreamSocket.on("error", () => destroyBoth("upstream socket error"));
+        upstreamSocket.on("end", () => destroyBoth("upstream socket ended"));
         upstreamSocket.on("close", () => destroyBoth("upstream socket closed"));
 
         try {
