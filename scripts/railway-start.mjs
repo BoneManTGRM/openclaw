@@ -34,7 +34,7 @@
 //   off: do not modify Sec-WebSocket-Protocol (recommended for iOS Safari)
 //   single: inject one token subprotocol
 //   multi: inject several token subprotocol variants (maximum compatibility, can break picky clients)
-// - OPENCLAW_WS_FORCE_LOCAL_ORIGIN defaults to true now (safer for loopback upstream)
+// - OPENCLAW_WS_FORCE_LOCAL_ORIGIN defaults to true now (safer for loopback upstream on Railway)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -373,6 +373,21 @@ function matchesReadyExpect(statusCode, expectSpec) {
   return expectSpec.exact?.has(str) || false;
 }
 
+// Redact token from logged exec lines only
+function redactTokenArgsForLog(args) {
+  const out = [];
+  const a = Array.isArray(args) ? args : [];
+  for (let i = 0; i < a.length; i++) {
+    const cur = String(a[i] ?? "");
+    out.push(cur);
+    if (cur === "--token" && i + 1 < a.length) {
+      out.push("<redacted>");
+      i++;
+    }
+  }
+  return out;
+}
+
 // Railway port (public)
 const externalPort = envInt("PORT", 8080);
 
@@ -508,6 +523,14 @@ const debugRequiresToken = envBool("OPENCLAW_DEBUG_REQUIRE_TOKEN", true);
 // Proxy enabled by default, disabled automatically if OpenClaw is listening on external.
 const proxyEnabled = envBool("OPENCLAW_PROXY_ENABLED", !openclawListenOnExternal);
 
+// IMPORTANT: Fix "pairing required" on Railway Control UI
+// Default is ON in proxy mode, OFF otherwise.
+// Override with OPENCLAW_CONTROL_UI_ALLOW_INSECURE_AUTH=0/1.
+const controlUiAllowInsecureAuth = envBool(
+  "OPENCLAW_CONTROL_UI_ALLOW_INSECURE_AUTH",
+  proxyEnabled ? true : false
+);
+
 // Use --force only if explicitly requested AND lsof exists.
 const forceRequested = envBool("OPENCLAW_FORCE", false);
 const forceEnabled = forceRequested && hasWorkingLsof();
@@ -591,6 +614,10 @@ console.log("[railway-start] wsStripProxyHeaders =", wsStripProxyHeaders ? "yes"
 console.log("[railway-start] wsForceLocalHostHeader =", wsForceLocalHostHeader ? "yes" : "no");
 console.log("[railway-start] wsForceLocalOrigin =", wsForceLocalOrigin ? "yes" : "no");
 console.log("[railway-start] wsTokenProtocolMode =", wsTokenProtocolMode);
+console.log(
+  "[railway-start] gateway.controlUi.allowInsecureAuth =",
+  controlUiAllowInsecureAuth ? "yes" : "no"
+);
 
 if (openclawListenOnExternal) {
   console.log("[railway-start] warning: OPENCLAW_LISTEN_ON_EXTERNAL=1 disables wrapper server");
@@ -652,6 +679,12 @@ function buildSanitizedConfig() {
   ]);
   cfg.gateway.trustedProxies = trusted;
 
+  // Fix pairing required in Control UI by allowing insecure auth for the UI layer
+  // Token auth is still enforced when configured below.
+  cfg.gateway.controlUi = {
+    allowInsecureAuth: !!controlUiAllowInsecureAuth,
+  };
+
   if (enforceTokenAuth && token) {
     cfg.gateway.auth = { mode: "token", token };
     console.log("[railway-start] gateway auth enabled (token)");
@@ -674,6 +707,10 @@ function buildCompatConfig() {
     ...parseTrustedProxies(),
   ]);
   base.gateway.trustedProxies = trusted;
+
+  // Fix pairing required in Control UI by allowing insecure auth for the UI layer
+  base.gateway.controlUi = typeof base.gateway.controlUi === "object" && base.gateway.controlUi ? base.gateway.controlUi : {};
+  base.gateway.controlUi.allowInsecureAuth = !!controlUiAllowInsecureAuth;
 
   delete base.trustProxy;
   delete base.trustedProxies;
@@ -712,7 +749,7 @@ if (selfSanitize) {
   }
 
   const existingGwKeys = Object.keys(existingGateway);
-  const keptGwKeys = ["port", "trustedProxies", "auth"];
+  const keptGwKeys = ["port", "trustedProxies", "controlUi", "auth"];
   const droppedGw = existingGwKeys.filter((k) => !keptGwKeys.includes(k));
   if (droppedGw.length) {
     console.log("[railway-start] selfSanitize: dropped gateway keys:", droppedGw.join(", "));
@@ -916,12 +953,14 @@ function spawnOpenClawProcess(bindMode) {
   }
 
   const args = [...resolved.argsPrefix, ...buildOpenClawArgs(bindMode)];
+  const argsForLog = redactTokenArgsForLog(args);
 
   childUsesTokenAuth = args.includes("--token") && !!token ? true : !!enforceTokenAuth;
 
   if (resolved.kind === "localbin" && useShellForLocalBin) {
     const cmdLine = shJoin(resolved.cmd, args);
-    console.log("[railway-start] exec shell:", cmdLine);
+    const cmdLineLog = shJoin(resolved.cmd, argsForLog);
+    console.log("[railway-start] exec shell:", cmdLineLog);
     return spawn(cmdLine, {
       stdio: ["ignore", "pipe", "pipe"],
       env: childEnv,
@@ -929,7 +968,7 @@ function spawnOpenClawProcess(bindMode) {
     });
   }
 
-  console.log("[railway-start] exec:", [resolved.cmd, ...args].join(" "));
+  console.log("[railway-start] exec:", [resolved.cmd, ...argsForLog].join(" "));
   return spawn(resolved.cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
 }
 
@@ -2098,6 +2137,8 @@ if (openclawListenOnExternal) {
         debugPublic,
         debugRequiresToken,
         selfSanitize,
+
+        controlUiAllowInsecureAuth,
 
         tokenFingerprint: tfp,
 
