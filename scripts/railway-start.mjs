@@ -18,6 +18,11 @@
 // IMPORTANT FIX ADDED HERE (most common Railway issue):
 // - OpenClaw sometimes ignores OPENCLAW_STATE_DIR and reads config only from $HOME/.openclaw (or /home/node/.openclaw).
 // - This script mirrors config and auth-profiles into BOTH the chosen writable stateDir AND any writable "standard" dirs.
+//
+// Additional fixes in this update
+// - Mirror dirs now include /root/.openclaw (some Railway images run as root).
+// - Hop-by-hop header set corrected to include "trailer" (not "trailers") and "proxy-connection".
+// - Response hop-by-hop filter matches the corrected set.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -496,6 +501,7 @@ const candidates = [
   process.env.OPENCLAW_STATE_DIR,
   "/data/.openclaw",
   "/home/node/.openclaw",
+  "/root/.openclaw",
   "/tmp/.openclaw",
 ].filter(Boolean);
 
@@ -573,6 +579,7 @@ function computeMirrorDirs(primaryDir) {
   if (home) out.push(path.join(home, ".openclaw"));
 
   out.push("/home/node/.openclaw");
+  out.push("/root/.openclaw");
   out.push("/data/.openclaw");
 
   out.push(primaryDir);
@@ -1325,8 +1332,9 @@ const HOP_BY_HOP = new Set([
   "keep-alive",
   "proxy-authenticate",
   "proxy-authorization",
+  "proxy-connection",
   "te",
-  "trailers",
+  "trailer",
   "transfer-encoding",
   "upgrade",
 ]);
