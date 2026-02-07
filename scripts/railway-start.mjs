@@ -9,45 +9,15 @@
 // - Fixes loopback Host header mismatch that can flip OpenClaw into "remote" mode.
 // - Optionally writes auth-profiles.json from env vars or ANTHROPIC_API_KEY / OPENAI_API_KEY.
 //
-// Key improvements in this update
-// 1) FIX: Token header name compatibility for new OpenClaw builds.
-//    OpenClaw now prefers Authorization: Bearer <token> and X-Clawdbot-Token header.
-//    Your previous script injected x-openclaw-token, which newer builds may ignore.
-//    This revision injects BOTH Authorization and X-Clawdbot-Token (and keeps x-openclaw-token as compat).
-// 2) Adaptive flag fallback: if OpenClaw does not support flags like --no-doctor or --allow-unconfigured,
-//    we detect "unknown option" and restart without the offending flag.
-// 3) Token injection is based on actual child token usage, not only OPENCLAW_ENFORCE_TOKEN_AUTH.
-// 4) Readiness checks inject the token when the child is using token auth (and can auto-detect 401/403).
-// 5) Proxy response headers are cleaned for hop-by-hop headers to avoid weirdness with some clients.
-// 6) Hardening around remoteAddress formatting and forwarded header sanitization.
-// 7) Safety: if enforce token auth is enabled but token is missing, auto disable it with a warning.
-// 8) Fix tcpCheck: avoid false negatives by not failing on "close" after a successful connect.
-// 9) Hardening: killChild only SIGKILL if still alive.
-// 10) Cleanup: do not keep an idle interval around in external listen mode by default
-//     (set OPENCLAW_EXTERNAL_WATCHDOG=1 if you want the external mode watchdog).
+// Key improvements in this revision
+// - Secure /debug by default when OPENCLAW_GATEWAY_TOKEN exists (toggle OPENCLAW_DEBUG_PUBLIC=1 to allow public).
+// - WS auth check runs before URL token param rewrite (future-proof if you ever allow query-param proxy auth).
+// - removeClientAuthHeaders drops only lowercase header keys (Node incoming headers are lowercase).
+// - rewriteUrlTokenParams is safe, only rewrites when a server token exists, and is used only for upstream path.
 //
 // IMPORTANT FIX ADDED HERE (most common Railway issue):
 // - OpenClaw sometimes ignores OPENCLAW_STATE_DIR and reads config only from $HOME/.openclaw (or /home/node/.openclaw).
-// - This script now mirrors config and auth-profiles into BOTH the chosen writable stateDir AND any writable "standard" dirs.
-//   This prevents "proxy/trustedProxies/auth" fixes from silently not applying even though the script printed "wrote config".
-//
-// Applied updates in this revision
-// - Mirror config/auth to standard dirs (HOME/.openclaw, /home/node/.openclaw, /data/.openclaw when writable)
-// - Improve WS stability: setNoDelay(true) on both sockets after upgrade
-// - Improve WS stability further: setNoDelay(true) on client socket as early as possible
-// - Harden destroyBoth(): attempt end() before destroy() to avoid stuck half-open sockets on mobile
-// - Add gentle delays between end() and destroy() to reduce Safari "closed before connect" incidence
-// - Optional: OPENCLAW_WS_FORCE_LOCAL_ORIGIN=1 can rewrite Origin to local in loopback upstream
-//
-// FIX FOR YOUR CURRENT LOGS (Loopback connection with non-local Host header)
-// The fix remains: for WS upgrades, force upstream Host to local (127.0.0.1:8081) by default, and ALSO send a minimal
-// rebuilt set of x-forwarded-* and x-real-ip so OpenClaw can still understand the true external origin.
-// Env toggle (default ON):
-//   OPENCLAW_WS_FORCE_LOCAL_HOST=1
-//
-// Existing env toggle (still honored):
-//   OPENCLAW_WS_STRIP_PROXY_HEADERS=1
-// In this revision, "strip" means: remove arbitrary proxy headers, then rebuild the minimal safe set.
+// - This script mirrors config and auth-profiles into BOTH the chosen writable stateDir AND any writable "standard" dirs.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -187,7 +157,6 @@ function tcpCheck(host, port, timeoutMs = 800) {
     sock.on("timeout", () => done(false));
     sock.on("error", () => done(false));
 
-    // Important: do not fail on close if we already connected successfully.
     sock.on("close", () => {
       if (!connected) done(false);
     });
@@ -419,8 +388,6 @@ let passGatewayTokenToChild =
   enforceTokenAuth || envBool("OPENCLAW_PASS_GATEWAY_TOKEN_TO_CHILD", false);
 
 // Runtime: whether the current child is actually using token auth.
-// This is used to decide whether to inject token headers into upstream requests.
-// It can be auto-detected via readiness 401/403 or logs.
 let childUsesTokenAuth = !!(enforceTokenAuth || passGatewayTokenToChild);
 
 // Safety: if enforceTokenAuth was requested but token is missing, disable it
@@ -481,7 +448,7 @@ const upstreamForceLocalHostHeader = envBool("OPENCLAW_UPSTREAM_FORCE_LOCAL_HOST
 // WS: strip arbitrary proxy-derived headers on upgrade (default ON)
 const wsStripProxyHeaders = envBool("OPENCLAW_WS_STRIP_PROXY_HEADERS", true);
 
-// WS: force upstream Host to local loopback (default ON, fixes your log)
+// WS: force upstream Host to local loopback (default ON)
 const wsForceLocalHostHeader = envBool("OPENCLAW_WS_FORCE_LOCAL_HOST", true);
 
 // Optional: if enabled, rewrite Origin to local when upstream is loopback
@@ -500,6 +467,11 @@ const useShellForLocalBin = envBool("OPENCLAW_SHELL_LOCAL_BIN", true);
 // Optional: enforce a token on inbound requests to the wrapper proxy.
 const enforceProxyToken = envBool("OPENCLAW_PROXY_ENFORCE_TOKEN", false);
 
+// /debug protection
+const debugPublic = envBool("OPENCLAW_DEBUG_PUBLIC", false);
+// If token exists and debugPublic is false, /debug requires token
+const debugRequiresToken = envBool("OPENCLAW_DEBUG_REQUIRE_TOKEN", true);
+
 // Proxy enabled by default, disabled automatically if OpenClaw is listening on external.
 const proxyEnabled = envBool("OPENCLAW_PROXY_ENABLED", !openclawListenOnExternal);
 
@@ -509,7 +481,8 @@ const forceEnabled = forceRequested && hasWorkingLsof();
 
 // Flags that may not exist on older builds
 let flagAllowUnconfigured = envBool("OPENCLAW_ALLOW_UNCONFIGURED", true);
-let flagNoDoctor = envBool("OPENCLAW_NO_DOCTOR", true);
+// Default false to avoid restart loops on builds that do not support it
+let flagNoDoctor = envBool("OPENCLAW_NO_DOCTOR", false);
 
 // Optional: enforce a strict retry without unknown flags by setting OPENCLAW_DISABLE_FLAG_AUTOFALLBACK=1
 const disableFlagAutofallback = envBool("OPENCLAW_DISABLE_FLAG_AUTOFALLBACK", false);
@@ -557,6 +530,8 @@ if (passGatewayTokenToChild && !token) {
 }
 console.log("[railway-start] autoPassTokenOnAuthError =", autoPassTokenOnAuthError ? "yes" : "no");
 console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" : "no");
+console.log("[railway-start] debugPublic =", debugPublic ? "yes" : "no");
+console.log("[railway-start] debugRequiresToken =", debugRequiresToken ? "yes" : "no");
 console.log("[railway-start] selfSanitize =", selfSanitize ? "yes" : "no");
 console.log("[railway-start] startupTimeoutMs =", startupTimeoutMs);
 console.log("[railway-start] bindPrimary =", bindPrimary, "bindFallback =", bindFallback);
@@ -590,21 +565,18 @@ if (openclawListenOnExternal) {
 
 safeMkdir(stateDir);
 
-// NEW: build a set of "standard" dirs OpenClaw may read from, and mirror config there if writable.
+// Build a set of "standard" dirs OpenClaw may read from, and mirror config there if writable.
 function computeMirrorDirs(primaryDir) {
   const out = [];
 
   const home = String(process.env.HOME || "").trim();
   if (home) out.push(path.join(home, ".openclaw"));
 
-  // Common Railway/Node images
   out.push("/home/node/.openclaw");
   out.push("/data/.openclaw");
 
-  // Include primary
   out.push(primaryDir);
 
-  // Only keep dirs we can write
   const writable = [];
   for (const d of uniq(out)) {
     if (canWriteDir(d)) writable.push(d);
@@ -623,7 +595,6 @@ const configBName = "config.json";
 const existing =
   readJsonIfExists(path.join(stateDir, configAName)) ||
   readJsonIfExists(path.join(stateDir, configBName)) ||
-  // Also try standard dirs in case stateDir differs from where OpenClaw last wrote
   (mirrorDirs
     .map((d) => readJsonIfExists(path.join(d, configAName)) || readJsonIfExists(path.join(d, configBName)))
     .find(Boolean) ||
@@ -716,7 +687,6 @@ if (selfSanitize) {
   trusted = built.trusted;
 }
 
-// NEW: write config into all mirrorDirs so OpenClaw cannot "miss" the config.
 for (const d of mirrorDirs) {
   safeMkdir(d);
   safeWriteJson(path.join(d, configAName), configToWrite);
@@ -737,7 +707,6 @@ for (const d of mirrorDirs) {
     return;
   }
 
-  // NEW: mirror auth-profiles into every mirrorDir as well.
   for (const baseDir of mirrorDirs) {
     const agentAuthDir = path.join(baseDir, "agents", "main", "agent");
     const authPath = path.join(agentAuthDir, "auth-profiles.json");
@@ -890,11 +859,7 @@ function currentBindForAttempt(attempt) {
 function spawnOpenClawProcess(bindMode) {
   const childEnv = { ...process.env };
 
-  // Primary state dir
   childEnv.OPENCLAW_STATE_DIR = stateDir;
-
-  // Also provide a couple of common alias env vars (harmless if ignored)
-  // This helps forks/builds that look for "config dir" rather than "state dir".
   childEnv.OPENCLAW_CONFIG_DIR = stateDir;
   childEnv.OPENCLAW_HOME_DIR = stateDir;
 
@@ -916,8 +881,6 @@ function spawnOpenClawProcess(bindMode) {
 
   const args = [...resolved.argsPrefix, ...buildOpenClawArgs(bindMode)];
 
-  // Update runtime auth mode based on the actual args we are about to use.
-  // If args include "--token", the child will enforce token auth.
   childUsesTokenAuth = args.includes("--token") && !!token ? true : !!enforceTokenAuth;
 
   if (resolved.kind === "localbin" && useShellForLocalBin) {
@@ -973,11 +936,9 @@ function applyGatewayTokenToHeaders(headers) {
   if (!shouldInjectGatewayToken()) return headers;
   const h = { ...(headers || {}) };
 
-  // New preferred headers:
   h["authorization"] = `Bearer ${token}`;
   h["x-clawdbot-token"] = token;
 
-  // Compat for older builds / forks:
   if (tokenHeaderCompat) {
     h["x-openclaw-token"] = token;
   }
@@ -988,7 +949,6 @@ function applyGatewayTokenToHeaders(headers) {
   return h;
 }
 
-// Force token headers regardless of childUsesTokenAuth (used only in detection paths).
 function applyGatewayTokenToHeadersForced(headers) {
   if (!token) return headers;
   const h = { ...(headers || {}) };
@@ -997,6 +957,65 @@ function applyGatewayTokenToHeadersForced(headers) {
   if (tokenHeaderCompat) h["x-openclaw-token"] = token;
   if (legacyGatewayTokenHeader) h["x-openclaw-gateway-token"] = token;
   return h;
+}
+
+// Removes any client-supplied auth headers to avoid stale-token loops
+function removeClientAuthHeaders(headersObj) {
+  const h = { ...(headersObj || {}) };
+  delete h["authorization"];
+  delete h["x-clawdbot-token"];
+  delete h["x-openclaw-token"];
+  delete h["x-openclaw-gateway-token"];
+  delete h["x-api-key"];
+  delete h["x-api_token"];
+  delete h["x-api-token"];
+  delete h["x-auth-token"];
+  delete h["x-access-token"];
+  delete h["apikey"];
+  delete h["api-key"];
+  return h;
+}
+
+// Token-like query keys sometimes used by clients
+const TOKEN_QUERY_KEYS = new Set([
+  "token",
+  "auth",
+  "authorization",
+  "bearer",
+  "access_token",
+  "access-token",
+  "api_key",
+  "api-key",
+  "apikey",
+  "key",
+  "x-api-key",
+  "x-auth-token",
+  "x-access-token",
+  "x-openclaw-token",
+  "x-openclaw-gateway-token",
+  "x-clawdbot-token",
+  "openclaw_token",
+  "claw_token",
+  "clawdbot_token",
+]);
+
+function rewriteUrlTokenParams(urlRaw) {
+  if (!token) return String(urlRaw || "/") || "/";
+  const raw = String(urlRaw || "/") || "/";
+  try {
+    const u = new URL(raw, "http://local.invalid");
+    let changed = false;
+    for (const k of TOKEN_QUERY_KEYS) {
+      if (u.searchParams.has(k)) {
+        u.searchParams.set(k, token);
+        changed = true;
+      }
+    }
+    if (!changed) return raw;
+    return `${u.pathname}${u.search}${u.hash}`;
+  } catch {
+    return raw;
+  }
 }
 
 function safeHeaderValue(v) {
@@ -1056,7 +1075,6 @@ async function isOpenClawReadySignal() {
   const r = await isPortReadyAnyHost();
   if (!r.ok) return { ok: false, detail: r };
 
-  // First try with current token injection decision.
   const first = await httpReadyCheckOnce(readyPath);
   if (first.ok) {
     return {
@@ -1065,8 +1083,6 @@ async function isOpenClawReadySignal() {
     };
   }
 
-  // Auto-detect token auth if upstream returns 401/403 and we have a token but are not currently injecting.
-  // Then retry once with forced token headers.
   if ((first.code === 401 || first.code === 403) && token && injectGatewayTokenHeaders && !childUsesTokenAuth) {
     const forced = await httpReadyCheckOnce(readyPath, { forceToken: true });
     if (forced.ok) {
@@ -1181,6 +1197,28 @@ function normalizeToken(s) {
 function checkProxyToken(req) {
   if (!enforceProxyToken) return { ok: true, reason: "disabled" };
   if (!token) return { ok: false, reason: "missing-server-token" };
+
+  const hdr =
+    normalizeToken(req.headers["x-clawdbot-token"]) ||
+    normalizeToken(req.headers["x-openclaw-token"]) ||
+    normalizeToken(req.headers["x-openclaw-gateway-token"]) ||
+    normalizeToken(req.headers["x-api-key"]) ||
+    "";
+
+  const auth = normalizeToken(req.headers["authorization"]);
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? normalizeToken(auth.slice(7)) : "";
+
+  const got = hdr || bearer;
+  if (!got) return { ok: false, reason: "missing-client-token" };
+  if (got !== token) return { ok: false, reason: "bad-client-token" };
+
+  return { ok: true, reason: "ok" };
+}
+
+function checkDebugToken(req) {
+  if (!debugRequiresToken) return { ok: true, reason: "debug-token-disabled" };
+  if (!token) return { ok: true, reason: "no-server-token" };
+  if (debugPublic) return { ok: true, reason: "debug-public" };
 
   const hdr =
     normalizeToken(req.headers["x-clawdbot-token"]) ||
@@ -1326,8 +1364,6 @@ function buildForwardedHeaders(req, opts = {}) {
   else if (priorXff) xff = safeHeaderValue(priorXff);
   else if (remoteAddr) xff = remoteAddr;
 
-  // WS path: sanitize arbitrary proxy-derived headers, then rebuild minimal safe forwarded headers.
-  // Also force upstream Host to local loopback by default when upstream is loopback.
   if (forWs && wsStripProxyHeaders) {
     const base = stripProxyDerivedHeaders(cleaned);
 
@@ -1346,14 +1382,14 @@ function buildForwardedHeaders(req, opts = {}) {
       [H_XFPORT]: String(externalPort),
     };
 
-    if (wsForceLocalOrigin && isLoopbackHost(upstreamHost) && rebuilt.origin) {
+    if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost) && rebuilt.origin) {
       rebuilt.origin = `${xfProto}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
     }
 
-    return applyGatewayTokenToHeaders(rebuilt);
+    const noClientAuth = removeClientAuthHeaders(rebuilt);
+    return applyGatewayTokenToHeaders(noClientAuth);
   }
 
-  // Non-strip path: keep most headers, but still ensure Host is sensible.
   if (forWs && wsForceLocalHostHeader && isLoopbackHost(upstreamHost)) {
     cleaned.host = buildLocalHostHeader(upstreamHost, internalPort);
   } else {
@@ -1378,7 +1414,8 @@ function buildForwardedHeaders(req, opts = {}) {
       rebuilt.origin = `${xfProto}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
     }
 
-    return applyGatewayTokenToHeaders(rebuilt);
+    const noClientAuth = removeClientAuthHeaders(rebuilt);
+    return applyGatewayTokenToHeaders(noClientAuth);
   }
 
   const withForwarded = {
@@ -1394,7 +1431,8 @@ function buildForwardedHeaders(req, opts = {}) {
     withForwarded.origin = `${xfProto}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
   }
 
-  return applyGatewayTokenToHeaders(withForwarded);
+  const noClientAuth = removeClientAuthHeaders(withForwarded);
+  return applyGatewayTokenToHeaders(noClientAuth);
 }
 
 async function isOpenClawReadyFast() {
@@ -1437,7 +1475,9 @@ function filterHopByHopResponseHeaders(headers, opts = {}) {
 }
 
 function requestUpstream(req, res) {
-  const url = req.url || "/";
+  const urlRaw = req.url || "/";
+  const url = rewriteUrlTokenParams(urlRaw);
+
   const headers = buildForwardedHeaders(req, { forWs: false });
 
   const client = selectUpstreamClient();
@@ -1458,8 +1498,6 @@ function requestUpstream(req, res) {
   }
 
   const proxyReq = client.request(options, (proxyRes) => {
-    // If upstream says 401/403 and we have a token but were not injecting because childUsesTokenAuth was false,
-    // enable it for future requests.
     const sc = Number(proxyRes.statusCode || 0);
     if ((sc === 401 || sc === 403) && token && injectGatewayTokenHeaders && !childUsesTokenAuth) {
       childUsesTokenAuth = true;
@@ -1644,7 +1682,6 @@ async function startOpenClawLoop() {
 
         if (handleUnknownFlagMaybe(ln)) return;
 
-        // If OpenClaw logs imply token mode, ensure we inject token on proxy and readiness.
         const low = String(ln || "").toLowerCase();
         if (low.includes("auth") && low.includes("token")) noteChildUsesToken("stdout indicates token auth");
 
@@ -1689,7 +1726,6 @@ async function startOpenClawLoop() {
           }
         }
 
-        // If OpenClaw is in token mode (or complains about tokens), inject in proxy path.
         if (low.includes("token")) {
           if (low.includes("token_mismatch") || low.includes("token mismatch")) {
             if (token && !injectGatewayTokenHeaders) {
@@ -1852,27 +1888,32 @@ if (openclawListenOnExternal) {
   });
 } else {
   const server = http.createServer(async (req, res) => {
-    const url = req.url || "/";
+    const urlRaw = req.url || "/";
+    const urlPath = String(urlRaw).split("?")[0] || "/";
+
+    if (urlPath === "/debug" && !debugPublic) {
+      const check = checkDebugToken(req);
+      if (!check.ok) return serveText(res, 401, "unauthorized");
+    }
 
     if (
       enforceProxyToken &&
-      url !== "/health" &&
-      url !== "/ready" &&
-      url !== "/debug" &&
-      !isPublicUiPath(url)
+      urlPath !== "/health" &&
+      urlPath !== "/ready" &&
+      !isPublicUiPath(urlPath)
     ) {
       const check = checkProxyToken(req);
       if (!check.ok) return serveText(res, 401, "unauthorized");
     }
 
-    if (url === "/health") return serveText(res, 200, "ok");
+    if (urlPath === "/health") return serveText(res, 200, "ok");
 
-    if (url === "/ready") {
+    if (urlPath === "/ready") {
       const ok = await isOpenClawReadyFast();
       return serveText(res, ok ? 200 : 503, ok ? "ready" : "not-ready");
     }
 
-    if (url === "/debug") {
+    if (urlPath === "/debug") {
       const sig = await isOpenClawReadySignal();
       const tfp = tokenFingerprint(token);
 
@@ -1911,6 +1952,8 @@ if (openclawListenOnExternal) {
         autoPassTokenOnAuthError,
 
         enforceProxyToken,
+        debugPublic,
+        debugRequiresToken,
         selfSanitize,
 
         tokenFingerprint: tfp,
@@ -2020,9 +2063,16 @@ if (openclawListenOnExternal) {
     };
 
     try {
-      const url = req.url || "/";
+      const urlRaw = req.url || "/";
+      const urlPath = String(urlRaw).split("?")[0] || "/";
 
-      if (enforceProxyToken && url !== "/debug" && !isPublicUiPath(url)) {
+      if (urlPath === "/debug" && !debugPublic) {
+        const check = checkDebugToken(req);
+        if (!check.ok) return destroyBoth("debug token rejected");
+      }
+
+      // Proxy token check happens before URL rewrite
+      if (enforceProxyToken && !isPublicUiPath(urlPath)) {
         const check = checkProxyToken(req);
         if (!check.ok) return destroyBoth("proxy token rejected");
       }
@@ -2032,6 +2082,7 @@ if (openclawListenOnExternal) {
       const isReady = await isOpenClawReadyFast();
       if (!isReady) return destroyBoth("upstream not ready");
 
+      const url = rewriteUrlTokenParams(urlRaw);
       const headers = buildForwardedHeaders(req, { forWs: true });
 
       const client = selectUpstreamClient();
@@ -2122,9 +2173,7 @@ if (openclawListenOnExternal) {
           upstreamSocket.setKeepAlive(true);
         } catch {}
 
-        // IMPORTANT: keep Connection and Upgrade on WS handshake response
         const safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers, { keepWsHandshake: true });
-        // Force required headers in case upstream response omits them
         safeHeaders.connection = safeHeaders.connection || "Upgrade";
         safeHeaders.upgrade = safeHeaders.upgrade || "websocket";
 
@@ -2159,7 +2208,6 @@ if (openclawListenOnExternal) {
           socket.resume();
         } catch {}
 
-        // Pipe both ways (same behavior, just not chained for easier debugging)
         socket.pipe(upstreamSocket);
         upstreamSocket.pipe(socket);
       });
