@@ -1900,6 +1900,7 @@ if (openclawListenOnExternal) {
       enforceProxyToken &&
       urlPath !== "/health" &&
       urlPath !== "/ready" &&
+      urlPath !== "/debug" &&
       !isPublicUiPath(urlPath)
     ) {
       const check = checkProxyToken(req);
@@ -2072,7 +2073,7 @@ if (openclawListenOnExternal) {
       }
 
       // Proxy token check happens before URL rewrite
-      if (enforceProxyToken && !isPublicUiPath(urlPath)) {
+      if (enforceProxyToken && urlPath !== "/debug" && !isPublicUiPath(urlPath)) {
         const check = checkProxyToken(req);
         if (!check.ok) return destroyBoth("proxy token rejected");
       }
