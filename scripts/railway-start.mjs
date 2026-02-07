@@ -35,6 +35,11 @@
 //   single: inject one token subprotocol
 //   multi: inject several token subprotocol variants (maximum compatibility, can break picky clients)
 // - OPENCLAW_WS_FORCE_LOCAL_ORIGIN defaults to true now (safer for loopback upstream on Railway)
+//
+// Fixes added in this update (for empty assistant replies debugging)
+// - Always rewrite Origin on WS when upstream is loopback and wsForceLocalOrigin is enabled.
+// - Add /openclaw-log endpoint to tail the OpenClaw log file from inside the container (secured like /debug).
+// - Log a safe fingerprint for ANTHROPIC_API_KEY presence (no secret printed).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -565,6 +570,7 @@ for (const dir of candidates) {
 }
 
 const tokenFp = tokenFingerprint(token);
+const anthropicKeyFp = tokenFingerprint(envStr("ANTHROPIC_API_KEY", "").trim());
 
 console.log("[railway-start] external PORT =", externalPort);
 console.log("[railway-start] internal OpenClaw port =", internalPort);
@@ -575,6 +581,10 @@ console.log("[railway-start] token present =", token ? "yes" : "no");
 console.log(
   "[railway-start] token fingerprint =",
   tokenFp.present ? `${tokenFp.sha256_8} (len ${tokenFp.len})` : "none"
+);
+console.log(
+  "[railway-start] ANTHROPIC_API_KEY =",
+  anthropicKeyFp.present ? `${anthropicKeyFp.sha256_8} (len ${anthropicKeyFp.len})` : "missing"
 );
 console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
 console.log("[railway-start] inject gateway token headers =", injectGatewayTokenHeaders ? "yes" : "no");
@@ -1547,8 +1557,8 @@ function buildForwardedHeaders(req, opts = {}) {
       [H_XFPORT]: String(externalPort),
     };
 
-    if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost) && rebuilt.origin) {
-      // Use upstreamProtocol here, not xfProto, to match what upstream sees
+    // IMPORTANT: always set Origin for WS when forcing local origin and upstream is loopback
+    if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost)) {
       rebuilt.origin = `${upstreamProtocol}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
     }
 
@@ -1581,7 +1591,8 @@ function buildForwardedHeaders(req, opts = {}) {
       [H_XFPORT]: String(externalPort),
     };
 
-    if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost) && rebuilt.origin) {
+    // IMPORTANT: always set Origin for WS when forcing local origin and upstream is loopback
+    if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost)) {
       rebuilt.origin = `${upstreamProtocol}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
     }
 
@@ -1603,7 +1614,8 @@ function buildForwardedHeaders(req, opts = {}) {
     [H_XFPORT]: String(externalPort),
   };
 
-  if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost) && withForwarded.origin) {
+  // IMPORTANT: always set Origin for WS when forcing local origin and upstream is loopback
+  if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost)) {
     withForwarded.origin = `${upstreamProtocol}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
   }
 
@@ -1653,6 +1665,76 @@ function filterHopByHopResponseHeaders(headers, opts = {}) {
     out[k] = v;
   }
   return out;
+}
+
+// -----------------
+// OpenClaw log tail helpers (/openclaw-log)
+// -----------------
+function safeReadDir(dir) {
+  try {
+    return fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+function safeStat(p) {
+  try {
+    return fs.statSync(p);
+  } catch {
+    return null;
+  }
+}
+
+function findLatestOpenClawLog() {
+  // OpenClaw commonly logs to: /tmp/openclaw/openclaw-YYYY-MM-DD.log
+  // We pick the newest by mtime from a few candidate dirs.
+  const dirs = uniq([
+    "/tmp/openclaw",
+    "/tmp",
+    path.join(stateDir, "tmp", "openclaw"),
+    path.join(stateDir, "openclaw"),
+  ]);
+
+  let best = { path: "", mtimeMs: 0 };
+
+  for (const d of dirs) {
+    const entries = safeReadDir(d);
+    for (const name of entries) {
+      if (!name || typeof name !== "string") continue;
+      if (!name.startsWith("openclaw-") || !name.endsWith(".log")) continue;
+      const p = path.join(d, name);
+      const st = safeStat(p);
+      if (!st || !st.isFile()) continue;
+      const m = Number(st.mtimeMs || 0);
+      if (m > best.mtimeMs) best = { path: p, mtimeMs: m };
+    }
+  }
+
+  // Fallback to the exact file shown in logs when present
+  if (!best.path) {
+    const fallback = "/tmp/openclaw/openclaw-" + new Date().toISOString().slice(0, 10) + ".log";
+    if (fs.existsSync(fallback)) return fallback;
+  }
+
+  return best.path || "";
+}
+
+function tailFile(filePath, lines = 600) {
+  const p = String(filePath || "").trim();
+  if (!p) return { ok: false, error: "no-log-found" };
+  if (!fs.existsSync(p)) return { ok: false, error: "missing", path: p };
+
+  try {
+    // Keep this simple and robust. Logs are usually not huge.
+    const txt = fs.readFileSync(p, "utf8");
+    const arr = txt.split("\n");
+    const n = clamp(Number(lines) || 600, 10, 5000);
+    const slice = arr.slice(Math.max(0, arr.length - n));
+    return { ok: true, path: p, lines: slice.length, text: slice.join("\n") };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e), path: p };
+  }
 }
 
 function requestUpstream(req, res) {
@@ -2077,11 +2159,17 @@ if (openclawListenOnExternal) {
       if (!check.ok) return serveText(res, 401, "unauthorized");
     }
 
+    if (urlPath === "/openclaw-log" && !debugPublic) {
+      const check = checkDebugToken(req);
+      if (!check.ok) return serveText(res, 401, "unauthorized");
+    }
+
     if (
       enforceProxyToken &&
       urlPath !== "/health" &&
       urlPath !== "/ready" &&
       urlPath !== "/debug" &&
+      urlPath !== "/openclaw-log" &&
       !isPublicUiPath(urlPath)
     ) {
       const check = checkProxyToken(req);
@@ -2095,9 +2183,34 @@ if (openclawListenOnExternal) {
       return serveText(res, ok ? 200 : 503, ok ? "ready" : "not-ready");
     }
 
+    if (urlPath === "/openclaw-log") {
+      const u = new URL(String(req.url || "/openclaw-log"), "http://local.invalid");
+      const linesRaw = u.searchParams.get("lines") || "600";
+      const n = clamp(Number(linesRaw) || 600, 10, 5000);
+
+      const p = findLatestOpenClawLog();
+      const t = tailFile(p, n);
+
+      if (!t.ok) {
+        return serveJson(res, 404, {
+          ok: false,
+          error: t.error || "no-log",
+          path: t.path || p || "",
+          hint: "OpenClaw logs are usually under /tmp/openclaw/openclaw-YYYY-MM-DD.log",
+        });
+      }
+
+      // Text output by default (easy to paste)
+      res.statusCode = 200;
+      res.setHeader("content-type", "text/plain");
+      res.end(t.text || "");
+      return;
+    }
+
     if (urlPath === "/debug") {
       const sig = await isOpenClawReadySignal();
       const tfp = tokenFingerprint(token);
+      const akp = tokenFingerprint(envStr("ANTHROPIC_API_KEY", "").trim());
 
       return serveJson(res, 200, {
         externalPort,
@@ -2141,6 +2254,7 @@ if (openclawListenOnExternal) {
         controlUiAllowInsecureAuth,
 
         tokenFingerprint: tfp,
+        anthropicKeyFingerprint: akp,
 
         startupTimeoutMs,
         watchdogIntervalMs,
@@ -2178,7 +2292,7 @@ if (openclawListenOnExternal) {
     }
 
     if (!proxyEnabled) {
-      return serveText(res, 404, "Proxy disabled. Use /health /ready /debug.");
+      return serveText(res, 404, "Proxy disabled. Use /health /ready /debug /openclaw-log.");
     }
 
     const isReady = await isOpenClawReadyFast();
@@ -2417,7 +2531,7 @@ if (openclawListenOnExternal) {
 
   server.listen(externalPort, "0.0.0.0", () => {
     console.log("[railway-start] public server listening on 0.0.0.0:" + externalPort);
-    console.log("[railway-start] endpoints: /health /ready /debug");
+    console.log("[railway-start] endpoints: /health /ready /debug /openclaw-log");
     console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
     if (proxyEnabled) {
       console.log(
