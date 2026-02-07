@@ -1074,6 +1074,26 @@ function buildWsSubprotocolHeader(protocols) {
   return uniq(protocols).join(", ");
 }
 
+function stripTokenProtocolsFromList(protocols) {
+  const list = Array.isArray(protocols) ? protocols : [];
+  return list.filter((p) => {
+    const lp = String(p || "").trim().toLowerCase();
+    return (
+      !lp.startsWith("openclaw-token.") &&
+      !lp.startsWith("gateway-token.") &&
+      !lp.startsWith("clawdbot-token.") &&
+      !lp.startsWith("token.")
+    );
+  });
+}
+
+function stripTokenProtocolsFromHeaderValue(headerValue) {
+  const current = headerValueToString(headerValue);
+  const protocols = parseWsSubprotocols(current);
+  const filtered = stripTokenProtocolsFromList(protocols);
+  return filtered;
+}
+
 function injectGatewayTokenIntoWsHeaders(headersObj) {
   // Always allow header-based token injection (Authorization / x-clawdbot-token)
   // Subprotocol token injection depends on wsTokenProtocolMode
@@ -1092,29 +1112,26 @@ function injectGatewayTokenIntoWsHeaders(headersObj) {
   const existing = withHttpHeaders["sec-websocket-protocol"] || "";
   const protocols = parseWsSubprotocols(existing);
 
-  // Remove any stale token protocols
-  const filtered = protocols.filter((p) => {
-    const lp = p.toLowerCase();
-    return (
-      !lp.startsWith("openclaw-token.") &&
-      !lp.startsWith("gateway-token.") &&
-      !lp.startsWith("clawdbot-token.") &&
-      !lp.startsWith("token.")
-    );
-  });
-
-  if (wsTokenProtocolMode === "single") {
-    filtered.push(`openclaw-token.${token}`);
-  } else {
-    // multi
-    filtered.push(`openclaw-token.${token}`);
-    filtered.push(`gateway-token.${token}`);
-    filtered.push(`clawdbot-token.${token}`);
-    filtered.push(`token.${token}`);
-  }
+  // Remove any stale token protocols, then append exactly one generic token.<token>
+  const filtered = stripTokenProtocolsFromList(protocols);
+  filtered.push(`token.${token}`);
 
   withHttpHeaders["sec-websocket-protocol"] = buildWsSubprotocolHeader(filtered);
   return withHttpHeaders;
+}
+
+function sanitizeWsHandshakeResponseHeaders(headersObj) {
+  const h = { ...(headersObj || {}) };
+  const key = "sec-websocket-protocol";
+  if (h[key] != null) {
+    const filtered = stripTokenProtocolsFromHeaderValue(h[key]);
+    if (!filtered.length) {
+      delete h[key];
+    } else {
+      h[key] = buildWsSubprotocolHeader(filtered);
+    }
+  }
+  return h;
 }
 
 function injectGatewayTokenIntoUpstreamWsPath(urlRaw) {
@@ -2306,7 +2323,10 @@ if (openclawListenOnExternal) {
           upstreamSocket.setKeepAlive(true);
         } catch {}
 
-        const safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers, { keepWsHandshake: true });
+        // Keep ws handshake headers, but strip any token.* style protocols so the browser never sees them.
+        let safeHeaders = filterHopByHopResponseHeaders(upstreamRes.headers, { keepWsHandshake: true });
+        safeHeaders = sanitizeWsHandshakeResponseHeaders(safeHeaders);
+
         safeHeaders.connection = safeHeaders.connection || "Upgrade";
         safeHeaders.upgrade = safeHeaders.upgrade || "websocket";
 
