@@ -10,39 +10,34 @@
 // - Optionally writes auth-profiles.json from env vars or ANTHROPIC_API_KEY / OPENAI_API_KEY.
 //
 // Key improvements in this update
-// 1) Adaptive flag fallback: if OpenClaw does not support flags like --no-doctor or --allow-unconfigured,
+// 1) FIX: Token header name compatibility for new OpenClaw builds.
+//    OpenClaw now prefers Authorization: Bearer <token> and X-Clawdbot-Token header.
+//    Your previous script injected x-openclaw-token, which newer builds may ignore.
+//    This revision injects BOTH Authorization and X-Clawdbot-Token (and keeps x-openclaw-token as compat).
+// 2) Adaptive flag fallback: if OpenClaw does not support flags like --no-doctor or --allow-unconfigured,
 //    we detect "unknown option" and restart without the offending flag.
-// 2) Token injection is based on actual child token usage, not only OPENCLAW_ENFORCE_TOKEN_AUTH.
-//    If the child is receiving a token (passGatewayTokenToChild) the proxy injects it upstream
-//    so Control UI avoids token_mismatch.
-// 3) Readiness checks inject the token when the child is using token auth.
-// 4) Proxy response headers are cleaned for hop-by-hop headers to avoid weirdness with some clients.
-// 5) Hardening around remoteAddress formatting and forwarded header sanitization.
-// 6) Safety: if enforce token auth is enabled but token is missing, auto disable it with a warning.
-//    Also recompute passGatewayTokenToChild so it does not stay stuck true when enforceTokenAuth flips off.
-// 7) Fix tcpCheck: avoid false negatives by not failing on "close" after a successful connect.
-// 8) Hardening: killChild only SIGKILL if still alive.
-// 9) Cleanup: do not keep an idle interval around in external listen mode by default
-//    (set OPENCLAW_EXTERNAL_WATCHDOG=1 if you want the external mode watchdog).
+// 3) Token injection is based on actual child token usage, not only OPENCLAW_ENFORCE_TOKEN_AUTH.
+// 4) Readiness checks inject the token when the child is using token auth.
+// 5) Proxy response headers are cleaned for hop-by-hop headers to avoid weirdness with some clients.
+// 6) Hardening around remoteAddress formatting and forwarded header sanitization.
+// 7) Safety: if enforce token auth is enabled but token is missing, auto disable it with a warning.
+// 8) Fix tcpCheck: avoid false negatives by not failing on "close" after a successful connect.
+// 9) Hardening: killChild only SIGKILL if still alive.
+// 10) Cleanup: do not keep an idle interval around in external listen mode by default
+//     (set OPENCLAW_EXTERNAL_WATCHDOG=1 if you want the external mode watchdog).
 //
 // Applied updates in this revision
-// - Reduce token exposure surface: inject Authorization + x-openclaw-token (drop x-openclaw-gateway-token)
+// - Token auth headers: Authorization + X-Clawdbot-Token (plus optional compat headers)
 // - Improve WS stability: setNoDelay(true) on both sockets after upgrade
-//
-// Additional fixes in this check
 // - Improve WS stability further: setNoDelay(true) on client socket as early as possible
 // - Harden destroyBoth(): attempt end() before destroy() to avoid stuck half-open sockets on mobile
 // - Add gentle delays between end() and destroy() to reduce Safari "closed before connect" incidence
 // - Optional: OPENCLAW_WS_FORCE_LOCAL_ORIGIN=1 can rewrite Origin to local in loopback upstream
 //
 // FIX FOR YOUR CURRENT LOGS (Loopback connection with non-local Host header)
-// Your logs show:
-//   [ws] Loopback connection with non-local Host header. Treating it as remote.
-// That happens when the proxy connects to OpenClaw over 127.0.0.1 but forwards Host as your public domain.
-// OpenClaw treats that as a remote connection and may refuse or close before connect.
-// The fix: for WS upgrades, force upstream Host to local (127.0.0.1:8081) by default, and ALSO send a minimal
+// The fix remains: for WS upgrades, force upstream Host to local (127.0.0.1:8081) by default, and ALSO send a minimal
 // rebuilt set of x-forwarded-* and x-real-ip so OpenClaw can still understand the true external origin.
-// New env toggle (default ON):
+// Env toggle (default ON):
 //   OPENCLAW_WS_FORCE_LOCAL_HOST=1
 //
 // Existing env toggle (still honored):
@@ -405,6 +400,11 @@ let enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 // Inject gateway token into upstream requests
 let injectGatewayTokenHeaders = envBool("OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS", true);
 
+// Optional compat: keep extra token header(s) for older builds (default ON for safety)
+const tokenHeaderCompat = envBool("OPENCLAW_TOKEN_HEADER_COMPAT", true);
+// Optional legacy header (default OFF): x-openclaw-gateway-token
+const legacyGatewayTokenHeader = envBool("OPENCLAW_LEGACY_GATEWAY_TOKEN_HEADER", false);
+
 // Auto-heal when OpenClaw complains auth token missing
 const autoPassTokenOnAuthError = envBool("OPENCLAW_AUTO_PASS_TOKEN_ON_AUTH_ERROR", true);
 
@@ -537,6 +537,8 @@ console.log(
 console.log("[railway-start] enforce gateway token auth =", enforceTokenAuth ? "yes" : "no");
 console.log("[railway-start] inject gateway token headers =", injectGatewayTokenHeaders ? "yes" : "no");
 console.log("[railway-start] pass gateway token to child =", passGatewayTokenToChild ? "yes" : "no");
+console.log("[railway-start] tokenHeaderCompat =", tokenHeaderCompat ? "yes" : "no");
+console.log("[railway-start] legacyGatewayTokenHeader =", legacyGatewayTokenHeader ? "yes" : "no");
 if (passGatewayTokenToChild && !token) {
   console.log("[railway-start] warning: passGatewayTokenToChild=1 but token is empty");
 }
@@ -907,8 +909,17 @@ function applyGatewayTokenToHeaders(headers) {
   if (!shouldInjectGatewayToken()) return headers;
   const h = { ...(headers || {}) };
 
-  h["x-openclaw-token"] = token;
+  // New preferred headers:
   h["authorization"] = `Bearer ${token}`;
+  h["x-clawdbot-token"] = token;
+
+  // Compat for older builds / forks:
+  if (tokenHeaderCompat) {
+    h["x-openclaw-token"] = token;
+  }
+  if (legacyGatewayTokenHeader) {
+    h["x-openclaw-gateway-token"] = token;
+  }
 
   return h;
 }
@@ -1070,6 +1081,7 @@ function checkProxyToken(req) {
   if (!token) return { ok: false, reason: "missing-server-token" };
 
   const hdr =
+    normalizeToken(req.headers["x-clawdbot-token"]) ||
     normalizeToken(req.headers["x-openclaw-token"]) ||
     normalizeToken(req.headers["x-openclaw-gateway-token"]) ||
     normalizeToken(req.headers["x-api-key"]) ||
@@ -1213,7 +1225,7 @@ function buildForwardedHeaders(req, opts = {}) {
   else if (remoteAddr) xff = remoteAddr;
 
   // WS path: sanitize arbitrary proxy-derived headers, then rebuild minimal safe forwarded headers.
-  // Also force upstream Host to local loopback by default when upstream is loopback (fixes your logs).
+  // Also force upstream Host to local loopback by default when upstream is loopback.
   if (forWs && wsStripProxyHeaders) {
     const base = stripProxyDerivedHeaders(cleaned);
 
@@ -1749,6 +1761,9 @@ if (openclawListenOnExternal) {
         enforceTokenAuth,
         injectGatewayTokenHeaders,
         passGatewayTokenToChild,
+
+        tokenHeaderCompat,
+        legacyGatewayTokenHeader,
 
         autoPassTokenOnAuthError,
 
