@@ -1151,7 +1151,7 @@ function injectGatewayTokenIntoWsHeaders(headersObj) {
 
   const h = { ...(headersObj || {}) };
 
-  // Always add HTTP-style headers
+  // Always add HTTP-style auth headers for upstream
   const withHttpHeaders = applyGatewayTokenToHeaders(h);
 
   if (wsTokenProtocolMode === "off") {
@@ -1161,9 +1161,22 @@ function injectGatewayTokenIntoWsHeaders(headersObj) {
   const existing = withHttpHeaders["sec-websocket-protocol"] || "";
   const protocols = parseWsSubprotocols(existing);
 
-  // Remove any stale token protocols, then append exactly one generic token.<token>
+  // Remove any stale token protocols first
   const filtered = stripTokenProtocolsFromList(protocols);
-  filtered.push(`token.${token}`);
+
+  if (wsTokenProtocolMode === "single") {
+    // Add exactly one generic token protocol
+    filtered.push(`token.${token}`);
+  } else if (wsTokenProtocolMode === "multi") {
+    // Add several variants for maximum compatibility with different upstream expectations
+    filtered.push(`token.${token}`);
+    filtered.push(`openclaw-token.${token}`);
+    filtered.push(`gateway-token.${token}`);
+    filtered.push(`clawdbot-token.${token}`);
+  } else {
+    // Safety fallback
+    filtered.push(`token.${token}`);
+  }
 
   withHttpHeaders["sec-websocket-protocol"] = buildWsSubprotocolHeader(filtered);
   return withHttpHeaders;
