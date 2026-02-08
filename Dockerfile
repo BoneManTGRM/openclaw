@@ -1,48 +1,74 @@
+# Dockerfile
+# Railway-friendly OpenClaw build (volume-safe)
+# - Uses /home/node/.openclaw for state + workspace (best for Railway volume mount)
+# - Installs curl + ca-certificates (bun installer + registries need these)
+# - Installs pnpm via corepack and pins PNPM_VERSION
+# - Installs bun as the node user so it works at runtime (owned by /home/node)
+# - Preserves good layer caching (copy manifests first, install deps, then copy rest)
+# - Runs as node at runtime
+
 FROM node:22-bookworm
-
-# Install Bun (required for build scripts)
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
-
-RUN corepack enable
 
 WORKDIR /app
 
+# Optional system packages (and required curl/ca-certs)
 ARG OPENCLAW_DOCKER_APT_PACKAGES=""
-RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
-      apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $OPENCLAW_DOCKER_APT_PACKAGES && \
-      apt-get clean && \
-      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    fi
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      $OPENCLAW_DOCKER_APT_PACKAGES; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
+# Enable corepack and activate pnpm explicitly
+ARG PNPM_VERSION=9.15.4
+RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
+
+# Bun install under the node user (so it is owned correctly and works at runtime)
+ENV BUN_INSTALL=/home/node/.bun
+ENV PATH="${BUN_INSTALL}/bin:${PATH}"
+
+# IMPORTANT: Put OpenClaw state + workspace under /home/node/.openclaw
+# Mount your Railway volume to /home/node/.openclaw
+ENV OPENCLAW_STATE_DIR=/home/node/.openclaw
+ENV OPENCLAW_WORKSPACE_DIR=/home/node/.openclaw/workspace
+
+RUN set -eux; \
+    mkdir -p /home/node/.bun /home/node/.openclaw /home/node/.openclaw/workspace; \
+    chown -R node:node /home/node /app
+
+USER node
+RUN set -eux; \
+    curl -fsSL https://bun.sh/install | bash; \
+    bun --version
+USER root
+
+# Copy only dependency manifests first (better Docker cache)
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY ui/package.json ./ui/package.json
 COPY patches ./patches
 COPY scripts ./scripts
 
+# Install deps (as root is fine; we fix ownership later)
 RUN pnpm install --frozen-lockfile
 
+# Copy the rest of the repo
 COPY . .
+
+# Build
 RUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build
-# Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:build
 
 ENV NODE_ENV=production
 
-# Allow non-root user to write temp files during runtime/tests.
-RUN chown -R node:node /app
+# Ensure runtime can write to state + workspace
+RUN set -eux; \
+    mkdir -p /home/node/.openclaw /home/node/.openclaw/workspace; \
+    chown -R node:node /app /home/node
 
-# Security hardening: Run as non-root user
-# The node:22-bookworm image includes a 'node' user (uid 1000)
-# This reduces the attack surface by preventing container escape via root privileges
 USER node
 
-# Start gateway server with default config.
-# Binds to loopback (127.0.0.1) by default for security.
-#
-# For container platforms requiring external health checks:
-#   1. Set OPENCLAW_GATEWAY_TOKEN or OPENCLAW_GATEWAY_PASSWORD env var
-#   2. Override CMD: ["node","openclaw.mjs","gateway","--allow-unconfigured","--bind","lan"]
-CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
+CMD ["node", "scripts/railway-start.mjs"]
