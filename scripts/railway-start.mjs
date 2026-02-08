@@ -5,7 +5,7 @@
 // - Starts OpenClaw gateway on an internal port (default 8081) and proxies Railway PORT to it.
 // - Optionally lets OpenClaw bind directly to Railway PORT when OPENCLAW_LISTEN_ON_EXTERNAL=1.
 // - Writes a safe OpenClaw config (openclaw.json + config.json) with gateway.port and gateway.trustedProxies.
-// - Prevents pairing-required loops on Railway by sanitizing proxy-derived headers in selfSanitize mode.
+// - Prevents pairing-required loops on Railway by sanitizing proxy-derived headers when selfSanitize is enabled.
 // - Fixes loopback Host header mismatch that can flip OpenClaw into "remote" mode.
 // - Optionally writes auth-profiles.json from env vars or ANTHROPIC_API_KEY / OPENAI_API_KEY.
 //
@@ -49,8 +49,10 @@
 // - Now, OPENCLAW_SELF_SANITIZE=1 means "patch in place" (preserve existing keys like channels).
 // - If you truly want the old strict minimal overwrite, set OPENCLAW_SELF_SANITIZE_STRICT=1.
 //
-// NEW FIX (requested):
-// - Self sanitize can be disabled by OPENCLAW_SELF_SANITIZE=0/false/off/no
+// IMPORTANT CHANGE IN THIS UPDATE (requested):
+// - selfSanitize default is now OFF.
+// - Enable by setting OPENCLAW_SELF_SANITIZE=1.
+// - It can be disabled explicitly via OPENCLAW_SELF_SANITIZE=0/false/off/no
 // - Also supports alternate disable env vars:
 //   OPENCLAW_DISABLE_SELF_SANITIZE=1, OPENCLAW_NO_SELF_SANITIZE=1, DISABLE_SELF_SANITIZE=1, NO_SELF_SANITIZE=1
 //
@@ -472,11 +474,13 @@ if (enforceTokenAuth && !token) {
 }
 
 // Self sanitize config behavior
-// - Default ON
+// - Default OFF in this update
+// - Enable via OPENCLAW_SELF_SANITIZE=1
 // - Disable via OPENCLAW_SELF_SANITIZE=0/false/off/no
 // - Also disable via OPENCLAW_DISABLE_SELF_SANITIZE=1, OPENCLAW_NO_SELF_SANITIZE=1, DISABLE_SELF_SANITIZE=1, NO_SELF_SANITIZE=1
-// - OPENCLAW_SELF_SANITIZE_STRICT=1 reverts to strict minimal overwrite behavior.
+// - OPENCLAW_SELF_SANITIZE_STRICT=1 forces strict minimal overwrite behavior (drops non-gateway keys).
 const selfSanitizeStrict = envBool("OPENCLAW_SELF_SANITIZE_STRICT", false);
+
 const selfSanitizeDisabledByAny =
   envTruthy("OPENCLAW_DISABLE_SELF_SANITIZE") ||
   envTruthy("OPENCLAW_NO_SELF_SANITIZE") ||
@@ -484,7 +488,8 @@ const selfSanitizeDisabledByAny =
   envTruthy("NO_SELF_SANITIZE") ||
   envFalsy("OPENCLAW_SELF_SANITIZE");
 
-const selfSanitize = selfSanitizeDisabledByAny ? false : envBool("OPENCLAW_SELF_SANITIZE", true);
+const selfSanitizeRequested = envBool("OPENCLAW_SELF_SANITIZE", false);
+const selfSanitize = selfSanitizeRequested && !selfSanitizeDisabledByAny;
 
 let startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 120000);
 startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
