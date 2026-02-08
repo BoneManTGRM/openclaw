@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
 import module from "node:module";
+import fs from "node:fs";
+import path from "node:path";
 
+// Enable Node compile cache when available
 // https://nodejs.org/api/module.html#module-compile-cache
 if (module.enableCompileCache && !process.env.NODE_DISABLE_COMPILE_CACHE) {
   try {
@@ -11,46 +14,49 @@ if (module.enableCompileCache && !process.env.NODE_DISABLE_COMPILE_CACHE) {
   }
 }
 
-const isModuleNotFoundError = (err) =>
-  err && typeof err === "object" && "code" in err && err.code === "ERR_MODULE_NOT_FOUND";
+/**
+ * Railway friendly defaults:
+ * - Keep ALL OpenClaw state inside /home/node/.openclaw (ideal for a Railway volume mount)
+ * - Keep workspace inside that same tree
+ *
+ * This also auto-fixes common bad values like /data/workspace that are not writable.
+ */
+const DEFAULT_STATE_DIR = "/home/node/.openclaw";
+const DEFAULT_WORKSPACE_DIR = "/home/node/.openclaw/workspace";
 
-const installProcessWarningFilter = async () => {
-  // Keep bootstrap warnings consistent with the TypeScript runtime.
-  for (const specifier of ["./dist/warning-filter.js", "./dist/warning-filter.mjs"]) {
-    try {
-      const mod = await import(specifier);
-      if (typeof mod.installProcessWarningFilter === "function") {
-        mod.installProcessWarningFilter();
-        return;
-      }
-    } catch (err) {
-      if (isModuleNotFoundError(err)) {
-        continue;
-      }
-      throw err;
-    }
-  }
-};
-
-await installProcessWarningFilter();
-
-const tryImport = async (specifier) => {
-  try {
-    await import(specifier);
-    return true;
-  } catch (err) {
-    // Only swallow missing-module errors; rethrow real runtime errors.
-    if (isModuleNotFoundError(err)) {
-      return false;
-    }
-    throw err;
-  }
-};
-
-if (await tryImport("./dist/entry.js")) {
-  // OK
-} else if (await tryImport("./dist/entry.mjs")) {
-  // OK
-} else {
-  throw new Error("openclaw: missing dist/entry.(m)js (build output).");
+function needsRewriteWorkspace(v) {
+  if (!v) return true;
+  const s = String(v).trim();
+  if (!s) return true;
+  // Common non-writable locations on Railway containers
+  if (s.startsWith("/data/")) return true;
+  if (s.startsWith("/root/")) return true;
+  return false;
 }
+
+if (!process.env.OPENCLAW_STATE_DIR || !String(process.env.OPENCLAW_STATE_DIR).trim()) {
+  process.env.OPENCLAW_STATE_DIR = DEFAULT_STATE_DIR;
+}
+
+if (needsRewriteWorkspace(process.env.OPENCLAW_WORKSPACE_DIR)) {
+  process.env.OPENCLAW_WORKSPACE_DIR = DEFAULT_WORKSPACE_DIR;
+}
+
+// Ensure dirs exist (and fail early with a clear error if not writable)
+try {
+  fs.mkdirSync(process.env.OPENCLAW_STATE_DIR, { recursive: true });
+  fs.mkdirSync(process.env.OPENCLAW_WORKSPACE_DIR, { recursive: true });
+
+  // Quick write test to confirm volume/permissions are ok
+  const probe = path.join(process.env.OPENCLAW_STATE_DIR, ".write-test");
+  fs.writeFileSync(probe, "ok");
+  fs.unlinkSync(probe);
+} catch (e) {
+  console.error("[openclaw.mjs] state/workspace not writable");
+  console.error("OPENCLAW_STATE_DIR =", process.env.OPENCLAW_STATE_DIR);
+  console.error("OPENCLAW_WORKSPACE_DIR =", process.env.OPENCLAW_WORKSPACE_DIR);
+  console.error(e && e.stack ? e.stack : e);
+  process.exit(1);
+}
+
+await import("./dist/entry.js");
