@@ -60,6 +60,13 @@
 // - If OPENCLAW_WORKSPACE_DIR is set but not writable (common on Railway when /data is not actually writable),
 //   this script auto-falls back to a writable workspace under stateDir and passes that to the child.
 // - This lets you keep OPENCLAW_WORKSPACE_DIR set without breaking the runtime.
+//
+// NEW FIX (Railway healthcheck resilience):
+// - Some Railway configs probe "/" by default.
+// - "/" is the UI route and may return 401/403/404 depending on upstream state and auth.
+// - This script can return 200 "ok" for "/" only when the request looks like a health probe,
+//   while still proxying "/" for real browsers.
+// - Toggle with OPENCLAW_ROOT_HEALTH_OK=0 to disable.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -596,6 +603,9 @@ const disableFlagAutofallback = envBool("OPENCLAW_DISABLE_FLAG_AUTOFALLBACK", fa
 let wsCloseDelayMs = envInt("OPENCLAW_WS_CLOSE_DELAY_MS", 120);
 wsCloseDelayMs = clamp(wsCloseDelayMs, 0, 1500);
 
+// Root healthcheck behavior for Railway
+const rootHealthOk = envBool("OPENCLAW_ROOT_HEALTH_OK", true);
+
 // Simplified stateDir selection
 const candidates = [
   process.env.OPENCLAW_STATE_DIR,
@@ -704,6 +714,7 @@ console.log("[railway-start] wsStripProxyHeaders =", wsStripProxyHeaders ? "yes"
 console.log("[railway-start] wsForceLocalHostHeader =", wsForceLocalHostHeader ? "yes" : "no");
 console.log("[railway-start] wsForceLocalOrigin =", wsForceLocalOrigin ? "yes" : "no");
 console.log("[railway-start] wsTokenProtocolMode =", wsTokenProtocolMode);
+console.log("[railway-start] rootHealthOk =", rootHealthOk ? "yes" : "no");
 console.log(
   "[railway-start] gateway.controlUi.allowInsecureAuth =",
   controlUiAllowInsecureAuth ? "yes" : "no"
@@ -1562,6 +1573,32 @@ function isPublicUiPath(url) {
   return false;
 }
 
+// Heuristic: treat "/" as 200 OK for health probes, but keep "/" proxied for browsers.
+function isLikelyHealthProbe(req) {
+  const method = String(req.method || "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") return false;
+
+  const ua = String(req.headers["user-agent"] || "").toLowerCase();
+  const accept = String(req.headers["accept"] || "").toLowerCase();
+
+  // Strong signals
+  if (ua.includes("railway")) return true;
+  if (ua.includes("health")) return true;
+  if (ua.includes("kube-probe")) return true;
+  if (ua.includes("elb-healthchecker")) return true;
+  if (ua.includes("googlehc")) return true;
+  if (ua.includes("go-http-client")) return true;
+
+  // If it does not look like a browser html navigation, assume it can be a probe.
+  const looksHtml = accept.includes("text/html") || accept.includes("application/xhtml+xml");
+  const looksBrowser =
+    ua.includes("mozilla") || ua.includes("safari") || ua.includes("chrome") || ua.includes("iphone") || ua.includes("ipad");
+
+  if (!looksHtml && !looksBrowser) return true;
+
+  return false;
+}
+
 const PROXY_DERIVED_HEADERS = new Set([
   "forwarded",
   "x-forwarded-for",
@@ -2285,6 +2322,11 @@ if (openclawListenOnExternal) {
     const urlRaw = req.url || "/";
     const urlPath = String(urlRaw).split("?")[0] || "/";
 
+    // Root health probe shortcut (does not break the UI for browsers)
+    if (rootHealthOk && urlPath === "/" && isLikelyHealthProbe(req)) {
+      return serveText(res, 200, "ok");
+    }
+
     if (urlPath === "/debug" && !debugPublic) {
       const check = checkDebugToken(req);
       if (!check.ok) return serveText(res, 401, "unauthorized");
@@ -2414,6 +2456,8 @@ if (openclawListenOnExternal) {
         wsForceLocalHostHeader,
         wsForceLocalOrigin,
         wsTokenProtocolMode,
+
+        rootHealthOk,
 
         trustedProxies: trusted,
         outTail: outRing.slice(-120),
