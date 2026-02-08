@@ -50,6 +50,11 @@
 // - Self sanitize can be disabled by OPENCLAW_SELF_SANITIZE=0/false/off/no
 // - Also supports alternate disable env vars:
 //   OPENCLAW_DISABLE_SELF_SANITIZE=1, OPENCLAW_NO_SELF_SANITIZE=1, DISABLE_SELF_SANITIZE=1, NO_SELF_SANITIZE=1
+//
+// NEW FIX (workspace dir safety):
+// - If OPENCLAW_WORKSPACE_DIR is set but not writable (common on Railway when /data is not actually writable),
+//   this script auto-falls back to a writable workspace under stateDir and passes that to the child.
+// - This lets you keep OPENCLAW_WORKSPACE_DIR set without breaking the runtime.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -525,9 +530,6 @@ const wsForceLocalHostHeader = envBool("OPENCLAW_WS_FORCE_LOCAL_HOST", true);
 const wsForceLocalOrigin = envBool("OPENCLAW_WS_FORCE_LOCAL_ORIGIN", true);
 
 // WS token protocol injection mode
-// off: do not modify Sec-WebSocket-Protocol (recommended for iOS Safari)
-// single: add one protocol containing token
-// multi: add multiple variants (maximum compatibility, sometimes breaks picky clients)
 function normalizeWsTokenProtocolMode(raw) {
   const s = String(raw || "").trim().toLowerCase();
   if (s === "off" || s === "none" || s === "0" || s === "false") return "off";
@@ -561,8 +563,6 @@ const debugRequiresToken = envBool("OPENCLAW_DEBUG_REQUIRE_TOKEN", true);
 const proxyEnabled = envBool("OPENCLAW_PROXY_ENABLED", !openclawListenOnExternal);
 
 // IMPORTANT: Fix "pairing required" on Railway Control UI
-// Default is ON in proxy mode, OFF otherwise.
-// Override with OPENCLAW_CONTROL_UI_ALLOW_INSECURE_AUTH=0/1.
 const controlUiAllowInsecureAuth = envBool(
   "OPENCLAW_CONTROL_UI_ALLOW_INSECURE_AUTH",
   proxyEnabled ? true : false
@@ -601,6 +601,32 @@ for (const dir of candidates) {
   }
 }
 
+safeMkdir(stateDir);
+
+// Workspace dir safety
+// If OPENCLAW_WORKSPACE_DIR is set but not writable, fall back to a writable dir under stateDir.
+function resolveWorkspaceDir(primaryStateDir) {
+  const requested = String(process.env.OPENCLAW_WORKSPACE_DIR || "").trim();
+  if (requested) {
+    if (canWriteDir(requested)) return { dir: requested, usedFallback: false, requested };
+    const fallback = path.join(primaryStateDir, "workspace");
+    safeMkdir(fallback);
+    console.log(
+      "[railway-start] warning: OPENCLAW_WORKSPACE_DIR is not writable:",
+      requested
+    );
+    console.log("[railway-start] using fallback workspaceDir:", fallback);
+    return { dir: fallback, usedFallback: true, requested };
+  }
+
+  const fallback = path.join(primaryStateDir, "workspace");
+  safeMkdir(fallback);
+  return { dir: fallback, usedFallback: false, requested: "" };
+}
+
+const workspaceResolved = resolveWorkspaceDir(stateDir);
+const workspaceDir = workspaceResolved.dir;
+
 const tokenFp = tokenFingerprint(token);
 const anthropicKeyFp = tokenFingerprint(envStr("ANTHROPIC_API_KEY", "").trim());
 
@@ -609,6 +635,17 @@ console.log("[railway-start] internal OpenClaw port =", internalPort);
 console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
 console.log("[railway-start] openclawListenOnExternal =", openclawListenOnExternal ? "yes" : "no");
 console.log("[railway-start] chosen stateDir =", stateDir);
+console.log("[railway-start] chosen workspaceDir =", workspaceDir);
+if (workspaceResolved.requested) {
+  console.log(
+    "[railway-start] OPENCLAW_WORKSPACE_DIR requested =",
+    workspaceResolved.requested,
+    "effective =",
+    workspaceDir,
+    "fallbackUsed =",
+    workspaceResolved.usedFallback ? "yes" : "no"
+  );
+}
 console.log("[railway-start] token present =", token ? "yes" : "no");
 console.log(
   "[railway-start] token fingerprint =",
@@ -667,8 +704,6 @@ if (openclawListenOnExternal) {
   console.log("[railway-start] recommended default on Railway is proxy mode (OPENCLAW_LISTEN_ON_EXTERNAL=0)");
   console.log("[railway-start] external watchdog enabled =", externalWatchdogEnabled ? "yes" : "no");
 }
-
-safeMkdir(stateDir);
 
 // Build a set of "standard" dirs OpenClaw may read from, and mirror config there if writable.
 function computeMirrorDirs(primaryDir) {
@@ -1036,6 +1071,9 @@ function spawnOpenClawProcess(bindMode) {
   childEnv.OPENCLAW_CONFIG_DIR = stateDir;
   childEnv.OPENCLAW_HOME_DIR = stateDir;
 
+  // Always pass a known-good workspace dir (may be the requested one or a fallback)
+  childEnv.OPENCLAW_WORKSPACE_DIR = workspaceDir;
+
   if (passGatewayTokenToChild && token) {
     childEnv.OPENCLAW_GATEWAY_TOKEN = token;
   }
@@ -1234,8 +1272,6 @@ function stripTokenProtocolsFromHeaderValue(headerValue) {
 }
 
 function injectGatewayTokenIntoWsHeaders(headersObj) {
-  // Always allow header-based token injection (Authorization / x-clawdbot-token)
-  // Subprotocol token injection depends on wsTokenProtocolMode
   if (!token) return headersObj;
   if (!childUsesTokenAuth) return headersObj;
 
@@ -1255,16 +1291,13 @@ function injectGatewayTokenIntoWsHeaders(headersObj) {
   const filtered = stripTokenProtocolsFromList(protocols);
 
   if (wsTokenProtocolMode === "single") {
-    // Add exactly one generic token protocol
     filtered.push(`token.${token}`);
   } else if (wsTokenProtocolMode === "multi") {
-    // Add several variants for maximum compatibility with different upstream expectations
     filtered.push(`token.${token}`);
     filtered.push(`openclaw-token.${token}`);
     filtered.push(`gateway-token.${token}`);
     filtered.push(`clawdbot-token.${token}`);
   } else {
-    // Safety fallback
     filtered.push(`token.${token}`);
   }
 
@@ -1287,7 +1320,6 @@ function sanitizeWsHandshakeResponseHeaders(headersObj) {
 }
 
 function injectGatewayTokenIntoUpstreamWsPath(urlRaw) {
-  // Inject token into upstream ws URL query as a fallback
   if (!token) return String(urlRaw || "/") || "/";
   if (!childUsesTokenAuth) return String(urlRaw || "/") || "/";
   const raw = String(urlRaw || "/") || "/";
@@ -1787,8 +1819,6 @@ function safeStat(p) {
 }
 
 function findLatestOpenClawLog() {
-  // OpenClaw commonly logs to: /tmp/openclaw/openclaw-YYYY-MM-DD.log
-  // We pick the newest by mtime from a few candidate dirs.
   const dirs = uniq([
     "/tmp/openclaw",
     "/tmp",
@@ -1811,7 +1841,6 @@ function findLatestOpenClawLog() {
     }
   }
 
-  // Fallback to the exact file shown in logs when present
   if (!best.path) {
     const fallback = "/tmp/openclaw/openclaw-" + new Date().toISOString().slice(0, 10) + ".log";
     if (fs.existsSync(fallback)) return fallback;
@@ -2299,7 +2328,6 @@ if (openclawListenOnExternal) {
         });
       }
 
-      // Text output by default (easy to paste)
       res.statusCode = 200;
       res.setHeader("content-type", "text/plain");
       res.end(t.text || "");
@@ -2333,6 +2361,7 @@ if (openclawListenOnExternal) {
         readyDetail: sig.detail,
 
         stateDir,
+        workspaceDir,
         mirrorDirs,
 
         enforceTokenAuth,
@@ -2573,7 +2602,7 @@ if (openclawListenOnExternal) {
           socket.setKeepAlive(true);
         } catch {}
         try {
-          upstreamSocket.setNoDelay(true); // FIXED: was "setNo jackDelay"
+          upstreamSocket.setNoDelay(true);
           upstreamSocket.setTimeout(0);
           upstreamSocket.setKeepAlive(true);
         } catch {}
