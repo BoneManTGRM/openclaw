@@ -2573,7 +2573,7 @@ if (openclawListenOnExternal) {
           socket.setKeepAlive(true);
         } catch {}
         try {
-          upstreamSocket.setNo jackDelay(true);
+          upstreamSocket.setNoDelay(true); // FIXED: was "setNo jackDelay"
           upstreamSocket.setTimeout(0);
           upstreamSocket.setKeepAlive(true);
         } catch {}
