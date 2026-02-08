@@ -13,7 +13,7 @@
 // - Secure /debug by default when OPENCLAW_GATEWAY_TOKEN exists (toggle OPENCLAW_DEBUG_PUBLIC=1 to allow public).
 // - WS auth check runs before URL token param rewrite (future-proof if you ever allow query-param proxy auth).
 // - removeClientAuthHeaders drops only lowercase header keys (Node incoming headers are lowercase).
-// - rewriteUrlTokenParams is safe, only rewrites when a server token exists, and is used only for upstream path.
+// - rewriteUrlTokenParams is now gated behind OPENCLAW_REWRITE_QUERY_TOKENS=1 (default off).
 //
 // IMPORTANT FIX ADDED HERE (most common Railway issue):
 // - OpenClaw sometimes ignores OPENCLAW_STATE_DIR and reads config only from $HOME/.openclaw (or /home/node/.openclaw).
@@ -29,12 +29,15 @@
 // - This proxy can inject the server token into both channels for upstream WS handshakes when childUsesTokenAuth.
 // - SAFARI NOTE: Many iOS Safari builds are picky about custom subprotocols. Use OPENCLAW_WS_TOKEN_PROTOCOL_MODE=off.
 //
-// New knobs added by this update
+// New knobs
 // - OPENCLAW_WS_TOKEN_PROTOCOL_MODE = off | single | multi
 //   off: do not modify Sec-WebSocket-Protocol (recommended for iOS Safari)
 //   single: inject one token subprotocol
 //   multi: inject several token subprotocol variants (maximum compatibility, can break picky clients)
 // - OPENCLAW_WS_FORCE_LOCAL_ORIGIN defaults to true now (safer for loopback upstream on Railway)
+// - OPENCLAW_REWRITE_QUERY_TOKENS = 0|1 (default 0)
+//   If enabled, the proxy will rewrite token-like query parameters in the upstream URL to the server token.
+//   Default is off to avoid breaking UI asset URLs that may contain query params.
 //
 // Fixes added in this update (for empty assistant replies debugging)
 // - Always rewrite Origin on WS when upstream is loopback and wsForceLocalOrigin is enabled.
@@ -437,6 +440,10 @@ let enforceTokenAuth = envBool("OPENCLAW_ENFORCE_TOKEN_AUTH", false);
 // Inject gateway token into upstream requests
 let injectGatewayTokenHeaders = envBool("OPENCLAW_INJECT_GATEWAY_TOKEN_HEADERS", true);
 
+// Query token rewrite (default OFF)
+const rewriteQueryTokens =
+  envBool("OPENCLAW_REWRITE_QUERY_TOKENS", false) || envBool("OPENCLAW_REWRITE_TOKEN_PARAMS", false);
+
 // Optional compat: keep extra token header(s) for older builds (default ON for safety)
 const tokenHeaderCompat = envBool("OPENCLAW_TOKEN_HEADER_COMPAT", true);
 // Optional legacy header (default OFF): x-openclaw-gateway-token
@@ -611,10 +618,7 @@ function resolveWorkspaceDir(primaryStateDir) {
     if (canWriteDir(requested)) return { dir: requested, usedFallback: false, requested };
     const fallback = path.join(primaryStateDir, "workspace");
     safeMkdir(fallback);
-    console.log(
-      "[railway-start] warning: OPENCLAW_WORKSPACE_DIR is not writable:",
-      requested
-    );
+    console.log("[railway-start] warning: OPENCLAW_WORKSPACE_DIR is not writable:", requested);
     console.log("[railway-start] using fallback workspaceDir:", fallback);
     return { dir: fallback, usedFallback: true, requested };
   }
@@ -661,6 +665,7 @@ console.log("[railway-start] pass gateway token to child =", passGatewayTokenToC
 console.log("[railway-start] childUsesTokenAuth =", childUsesTokenAuth ? "yes" : "no");
 console.log("[railway-start] tokenHeaderCompat =", tokenHeaderCompat ? "yes" : "no");
 console.log("[railway-start] legacyGatewayTokenHeader =", legacyGatewayTokenHeader ? "yes" : "no");
+console.log("[railway-start] rewriteQueryTokens =", rewriteQueryTokens ? "yes" : "no");
 if (passGatewayTokenToChild && !token) {
   console.log("[railway-start] warning: passGatewayTokenToChild=1 but token is empty");
 }
@@ -1043,9 +1048,7 @@ function buildOpenClawArgs(bindMode) {
     if (token) {
       args.push("--token", token);
     } else {
-      console.log(
-        "[railway-start] warning: passGatewayTokenToChild=1 but token is empty, skipping --token"
-      );
+      console.log("[railway-start] warning: passGatewayTokenToChild=1 but token is empty, skipping --token");
     }
   }
 
@@ -1099,11 +1102,7 @@ function spawnOpenClawProcess(bindMode) {
     const cmdLine = shJoin(resolved.cmd, args);
     const cmdLineLog = shJoin(resolved.cmd, argsForLog);
     console.log("[railway-start] exec shell:", cmdLineLog);
-    return spawn(cmdLine, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: childEnv,
-      shell: true,
-    });
+    return spawn(cmdLine, { stdio: ["ignore", "pipe", "pipe"], env: childEnv, shell: true });
   }
 
   console.log("[railway-start] exec:", [resolved.cmd, ...argsForLog].join(" "));
@@ -1190,6 +1189,7 @@ function removeClientAuthHeaders(headersObj) {
 }
 
 // Token-like query keys sometimes used by clients
+// NOTE: "key" is intentionally excluded to avoid breaking UI asset URLs.
 const TOKEN_QUERY_KEYS = new Set([
   "token",
   "auth",
@@ -1200,7 +1200,6 @@ const TOKEN_QUERY_KEYS = new Set([
   "api_key",
   "api-key",
   "apikey",
-  "key",
   "x-api-key",
   "x-auth-token",
   "x-access-token",
@@ -1213,8 +1212,9 @@ const TOKEN_QUERY_KEYS = new Set([
 ]);
 
 function rewriteUrlTokenParams(urlRaw) {
-  if (!token) return String(urlRaw || "/") || "/";
   const raw = String(urlRaw || "/") || "/";
+  if (!rewriteQueryTokens) return raw;
+  if (!token) return raw;
   try {
     const u = new URL(raw, "http://local.invalid");
     let changed = false;
@@ -2111,9 +2111,7 @@ async function startOpenClawLoop() {
           if (hit) {
             passGatewayTokenToChild = true;
             noteChildUsesToken("stderr auth missing suggests token mode");
-            console.log(
-              "[railway-start] detected auth token missing; enabling passGatewayTokenToChild for next restart"
-            );
+            console.log("[railway-start] detected auth token missing; enabling passGatewayTokenToChild for next restart");
           }
         }
 
@@ -2382,6 +2380,8 @@ if (openclawListenOnExternal) {
 
         controlUiAllowInsecureAuth,
 
+        rewriteQueryTokens,
+
         tokenFingerprint: tfp,
         anthropicKeyFingerprint: akp,
 
@@ -2511,7 +2511,7 @@ if (openclawListenOnExternal) {
       if (!isReady) return destroyBoth("upstream not ready");
 
       // Build upstream WS path:
-      // 1) rewrite any token-like params if present
+      // 1) optionally rewrite token-like params if present (gated by OPENCLAW_REWRITE_QUERY_TOKENS)
       // 2) ensure ?token=... exists for upstream as fallback
       const urlRewritten = rewriteUrlTokenParams(urlRaw);
       const url = injectGatewayTokenIntoUpstreamWsPath(urlRewritten);
@@ -2663,10 +2663,7 @@ if (openclawListenOnExternal) {
     console.log("[railway-start] endpoints: /health /ready /debug /openclaw-log");
     console.log("[railway-start] proxyEnabled =", proxyEnabled ? "yes" : "no");
     if (proxyEnabled) {
-      console.log(
-        "[railway-start] proxying other routes to",
-        `${upstreamProtocol}://${upstreamHost}:${internalPort}`
-      );
+      console.log("[railway-start] proxying other routes to", `${upstreamProtocol}://${upstreamHost}:${internalPort}`);
     }
 
     setTimeout(() => startOpenClawLoop(), 400);
