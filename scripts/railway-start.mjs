@@ -40,6 +40,16 @@
 // - Always rewrite Origin on WS when upstream is loopback and wsForceLocalOrigin is enabled.
 // - Add /openclaw-log endpoint to tail the OpenClaw log file from inside the container (secured like /debug).
 // - Log a safe fingerprint for ANTHROPIC_API_KEY presence (no secret printed).
+//
+// IMPORTANT CONFIG FIX (channels disappearing):
+// - Previous "selfSanitize" behavior overwrote config with a minimal object and dropped keys like channels.
+// - Now, OPENCLAW_SELF_SANITIZE=1 means "patch in place" (preserve existing keys like channels).
+// - If you truly want the old strict minimal overwrite, set OPENCLAW_SELF_SANITIZE_STRICT=1.
+//
+// NEW FIX (requested):
+// - Self sanitize can be disabled by OPENCLAW_SELF_SANITIZE=0/false/off/no
+// - Also supports alternate disable env vars:
+//   OPENCLAW_DISABLE_SELF_SANITIZE=1, OPENCLAW_NO_SELF_SANITIZE=1, DISABLE_SELF_SANITIZE=1, NO_SELF_SANITIZE=1
 
 import fs from "node:fs";
 import path from "node:path";
@@ -59,6 +69,16 @@ function envBool(name, defaultValue = false) {
   const v = String(process.env[name] || "").trim().toLowerCase();
   if (!v) return defaultValue;
   return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function envTruthy(name) {
+  const v = String(process.env[name] || "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function envFalsy(name) {
+  const v = String(process.env[name] || "").trim().toLowerCase();
+  return v === "0" || v === "false" || v === "no" || v === "off";
 }
 
 function envInt(name, fallback) {
@@ -439,8 +459,20 @@ if (enforceTokenAuth && !token) {
   childUsesTokenAuth = !!passGatewayTokenToChild;
 }
 
-// Self sanitize config to a strict minimal object that cannot contain unknown keys.
-const selfSanitize = envBool("OPENCLAW_SELF_SANITIZE", true);
+// Self sanitize config behavior
+// - Default ON
+// - Disable via OPENCLAW_SELF_SANITIZE=0/false/off/no
+// - Also disable via OPENCLAW_DISABLE_SELF_SANITIZE=1, OPENCLAW_NO_SELF_SANITIZE=1, DISABLE_SELF_SANITIZE=1, NO_SELF_SANITIZE=1
+// - OPENCLAW_SELF_SANITIZE_STRICT=1 reverts to strict minimal overwrite behavior.
+const selfSanitizeStrict = envBool("OPENCLAW_SELF_SANITIZE_STRICT", false);
+const selfSanitizeDisabledByAny =
+  envTruthy("OPENCLAW_DISABLE_SELF_SANITIZE") ||
+  envTruthy("OPENCLAW_NO_SELF_SANITIZE") ||
+  envTruthy("DISABLE_SELF_SANITIZE") ||
+  envTruthy("NO_SELF_SANITIZE") ||
+  envFalsy("OPENCLAW_SELF_SANITIZE");
+
+const selfSanitize = selfSanitizeDisabledByAny ? false : envBool("OPENCLAW_SELF_SANITIZE", true);
 
 let startupTimeoutMs = envInt("OPENCLAW_STARTUP_TIMEOUT_MS", 120000);
 startupTimeoutMs = clamp(startupTimeoutMs, 15000, 600000);
@@ -600,6 +632,7 @@ console.log("[railway-start] enforce proxy token =", enforceProxyToken ? "yes" :
 console.log("[railway-start] debugPublic =", debugPublic ? "yes" : "no");
 console.log("[railway-start] debugRequiresToken =", debugRequiresToken ? "yes" : "no");
 console.log("[railway-start] selfSanitize =", selfSanitize ? "yes" : "no");
+console.log("[railway-start] selfSanitizeStrict =", selfSanitizeStrict ? "yes" : "no");
 console.log("[railway-start] startupTimeoutMs =", startupTimeoutMs);
 console.log("[railway-start] bindPrimary =", bindPrimary, "bindFallback =", bindFallback);
 console.log("[railway-start] OPENCLAW_SHELL_LOCAL_BIN =", useShellForLocalBin ? "yes" : "no");
@@ -664,7 +697,7 @@ console.log("[railway-start] config mirrorDirs =", mirrorDirs.join(", "));
 const configAName = "openclaw.json";
 const configBName = "config.json";
 
-// Read existing config (if any) then sanitize.
+// Read existing config (if any)
 const existing =
   readJsonIfExists(path.join(stateDir, configAName)) ||
   readJsonIfExists(path.join(stateDir, configBName)) ||
@@ -674,10 +707,75 @@ const existing =
     {}) ||
   {};
 
-const existingGateway =
-  typeof existing?.gateway === "object" && existing.gateway ? existing.gateway : {};
+function isPlainObject(x) {
+  return !!x && typeof x === "object" && !Array.isArray(x);
+}
 
-function buildSanitizedConfig() {
+function deepCloneJson(obj) {
+  try {
+    if (typeof globalThis.structuredClone === "function") return globalThis.structuredClone(obj);
+  } catch {}
+  try {
+    return JSON.parse(JSON.stringify(obj ?? {}));
+  } catch {
+    return {};
+  }
+}
+
+function getExistingGateway(base) {
+  if (!isPlainObject(base)) return {};
+  return isPlainObject(base.gateway) ? base.gateway : {};
+}
+
+const existingGateway = getExistingGateway(existing);
+
+function dropLegacyBadKeys(cfg) {
+  if (!isPlainObject(cfg)) return;
+
+  // Remove known legacy keys that have caused crashes or schema confusion
+  delete cfg.trustProxy;
+  delete cfg.trustedProxies;
+
+  if (isPlainObject(cfg.gateway)) {
+    delete cfg.gateway.trustProxy;
+    delete cfg.gateway.trustProxies;
+    delete cfg.gateway.pairingRequired;
+  }
+}
+
+function buildPatchedConfigPreserveAll() {
+  // Preserve all existing keys (channels, providers, agents, etc)
+  const base = isPlainObject(existing) ? deepCloneJson(existing) : {};
+  base.gateway = isPlainObject(base.gateway) ? base.gateway : {};
+
+  base.gateway.port = Number(internalPort);
+
+  const trusted = uniq([
+    ...(Array.isArray(base.gateway.trustedProxies) ? base.gateway.trustedProxies : []),
+    ...parseTrustedProxies(),
+  ]);
+  base.gateway.trustedProxies = trusted;
+
+  base.gateway.controlUi = isPlainObject(base.gateway.controlUi) ? base.gateway.controlUi : {};
+  base.gateway.controlUi.allowInsecureAuth = !!controlUiAllowInsecureAuth;
+
+  dropLegacyBadKeys(base);
+
+  if (enforceTokenAuth && token) {
+    base.gateway.auth = isPlainObject(base.gateway.auth) ? base.gateway.auth : {};
+    base.gateway.auth.mode = "token";
+    base.gateway.auth.token = token;
+    console.log("[railway-start] gateway auth enabled (token)");
+  } else {
+    delete base.gateway.auth;
+    console.log("[railway-start] gateway auth not configured");
+  }
+
+  return { cfg: base, trusted };
+}
+
+function buildStrictSanitizedConfigMinimal() {
+  // Old behavior: write only gateway keys. This can drop channels.
   const cfg = {};
   cfg.gateway = {};
 
@@ -689,8 +787,6 @@ function buildSanitizedConfig() {
   ]);
   cfg.gateway.trustedProxies = trusted;
 
-  // Fix pairing required in Control UI by allowing insecure auth for the UI layer
-  // Token auth is still enforced when configured below.
   cfg.gateway.controlUi = {
     allowInsecureAuth: !!controlUiAllowInsecureAuth,
   };
@@ -707,8 +803,8 @@ function buildSanitizedConfig() {
 }
 
 function buildCompatConfig() {
-  const base = typeof existing === "object" && existing ? existing : {};
-  base.gateway = typeof base.gateway === "object" && base.gateway ? base.gateway : {};
+  const base = isPlainObject(existing) ? deepCloneJson(existing) : {};
+  base.gateway = isPlainObject(base.gateway) ? base.gateway : {};
 
   base.gateway.port = Number(internalPort);
 
@@ -718,20 +814,13 @@ function buildCompatConfig() {
   ]);
   base.gateway.trustedProxies = trusted;
 
-  // Fix pairing required in Control UI by allowing insecure auth for the UI layer
-  base.gateway.controlUi = typeof base.gateway.controlUi === "object" && base.gateway.controlUi ? base.gateway.controlUi : {};
+  base.gateway.controlUi = isPlainObject(base.gateway.controlUi) ? base.gateway.controlUi : {};
   base.gateway.controlUi.allowInsecureAuth = !!controlUiAllowInsecureAuth;
 
-  delete base.trustProxy;
-  delete base.trustedProxies;
-  if (base.gateway) {
-    delete base.gateway.trustProxy;
-    delete base.gateway.trustProxies;
-    delete base.gateway.pairingRequired;
-  }
+  dropLegacyBadKeys(base);
 
   if (enforceTokenAuth && token) {
-    base.gateway.auth = base.gateway.auth || {};
+    base.gateway.auth = isPlainObject(base.gateway.auth) ? base.gateway.auth : {};
     base.gateway.auth.mode = "token";
     base.gateway.auth.token = token;
     console.log("[railway-start] gateway auth enabled (token)");
@@ -747,22 +836,23 @@ let trusted = [];
 let configToWrite = null;
 
 if (selfSanitize) {
-  const built = buildSanitizedConfig();
+  const built = selfSanitizeStrict ? buildStrictSanitizedConfigMinimal() : buildPatchedConfigPreserveAll();
   configToWrite = built.cfg;
   trusted = built.trusted;
 
-  const existingRootKeys = Object.keys(typeof existing === "object" && existing ? existing : {});
-  const keptRootKeys = ["gateway"];
-  const droppedRoot = existingRootKeys.filter((k) => !keptRootKeys.includes(k));
-  if (droppedRoot.length) {
-    console.log("[railway-start] selfSanitize: dropped root keys:", droppedRoot.join(", "));
-  }
-
-  const existingGwKeys = Object.keys(existingGateway);
-  const keptGwKeys = ["port", "trustedProxies", "controlUi", "auth"];
-  const droppedGw = existingGwKeys.filter((k) => !keptGwKeys.includes(k));
-  if (droppedGw.length) {
-    console.log("[railway-start] selfSanitize: dropped gateway keys:", droppedGw.join(", "));
+  if (selfSanitizeStrict) {
+    const existingRootKeys = Object.keys(isPlainObject(existing) ? existing : {});
+    const keptRootKeys = ["gateway"];
+    const droppedRoot = existingRootKeys.filter((k) => !keptRootKeys.includes(k));
+    if (droppedRoot.length) {
+      console.log("[railway-start] selfSanitizeStrict: dropped root keys:", droppedRoot.join(", "));
+    }
+    const existingGwKeys = Object.keys(existingGateway);
+    const keptGwKeys = ["port", "trustedProxies", "controlUi", "auth"];
+    const droppedGw = existingGwKeys.filter((k) => !keptGwKeys.includes(k));
+    if (droppedGw.length) {
+      console.log("[railway-start] selfSanitizeStrict: dropped gateway keys:", droppedGw.join(", "));
+    }
   }
 } else {
   const built = buildCompatConfig();
@@ -1570,7 +1660,6 @@ function buildForwardedHeaders(req, opts = {}) {
       [H_XFPORT]: String(externalPort),
     };
 
-    // IMPORTANT: always set Origin for WS when forcing local origin and upstream is loopback
     if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost)) {
       rebuilt.origin = `${upstreamProtocol}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
     }
@@ -1604,7 +1693,6 @@ function buildForwardedHeaders(req, opts = {}) {
       [H_XFPORT]: String(externalPort),
     };
 
-    // IMPORTANT: always set Origin for WS when forcing local origin and upstream is loopback
     if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost)) {
       rebuilt.origin = `${upstreamProtocol}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
     }
@@ -1627,7 +1715,6 @@ function buildForwardedHeaders(req, opts = {}) {
     [H_XFPORT]: String(externalPort),
   };
 
-  // IMPORTANT: always set Origin for WS when forcing local origin and upstream is loopback
   if (forWs && wsForceLocalOrigin && isLoopbackHost(upstreamHost)) {
     withForwarded.origin = `${upstreamProtocol}://${buildLocalHostHeader(upstreamHost, internalPort)}`;
   }
@@ -1739,7 +1826,6 @@ function tailFile(filePath, lines = 600) {
   if (!fs.existsSync(p)) return { ok: false, error: "missing", path: p };
 
   try {
-    // Keep this simple and robust. Logs are usually not huge.
     const txt = fs.readFileSync(p, "utf8");
     const arr = txt.split("\n");
     const n = clamp(Number(lines) || 600, 10, 5000);
@@ -2263,6 +2349,7 @@ if (openclawListenOnExternal) {
         debugPublic,
         debugRequiresToken,
         selfSanitize,
+        selfSanitizeStrict,
 
         controlUiAllowInsecureAuth,
 
@@ -2486,7 +2573,7 @@ if (openclawListenOnExternal) {
           socket.setKeepAlive(true);
         } catch {}
         try {
-          upstreamSocket.setNoDelay(true);
+          upstreamSocket.setNo jackDelay(true);
           upstreamSocket.setTimeout(0);
           upstreamSocket.setKeepAlive(true);
         } catch {}
